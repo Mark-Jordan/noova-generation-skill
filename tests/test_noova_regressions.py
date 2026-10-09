@@ -205,14 +205,23 @@ class BaseUrlBypassTest(unittest.TestCase):
         nc.clear_resolve_cache()
 
     def test_trailing_dot_fqdn_is_caught(self):
-        """修复前：`http://localhost.` → ok=True（getaddrinfo 解析到 127.0.0.1）。"""
+        """修复前：`http://localhost.` → ok=True（getaddrinfo 解析到 127.0.0.1）。
+
+        归一化后 `localhost.` → `localhost` 会被**字面量**判据拦下，不依赖 DNS。
+        """
         result = nc.check_base_url("http://localhost.")
         self.assertFalse(result["ok"])
         self.assertTrue(result["local"])
 
     def test_wildcard_dns_to_loopback_is_caught(self):
-        """修复前：`127.0.0.1.nip.io` 字面量正常，纯字面量守卫拦不住。"""
-        self.assertFalse(nc.check_base_url("https://127.0.0.1.nip.io:8080")["ok"])
+        """修复前：`127.0.0.1.nip.io` 字面量正常，纯字面量守卫拦不住。
+
+        这里**注入**解析结果（而不是依赖真实 DNS）：`nip.io` 能不能解析出
+        127.0.0.1 取决于运行环境的解析器，靠真实 DNS 会让用例在离线 /
+        受限网络的 CI 上随机变红。被测的是「解析到回环时必须拦下」这一逻辑。
+        """
+        with mock.patch.object(nc, "resolves_to_local", return_value=True):
+            self.assertFalse(nc.check_base_url("https://127.0.0.1.nip.io:8080")["ok"])
 
     def test_userinfo_disguise_is_rejected(self):
         """`https://noova.vip@evil.example.com` 的真实 host 是 evil.example.com。"""

@@ -21,6 +21,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 SCRIPTS = PROJECT / "skills" / "noova-generation" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import noova_common as nc  # noqa: E402
 import noova_key  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -641,8 +642,13 @@ class BaseUrlGuardTest(unittest.TestCase):
         self.assertIn("用户名", result["reason"])
 
     def test_wildcard_dns_pointing_at_loopback_rejected(self):
-        """`127.0.0.1.nip.io` 字面量完全正常，只有解析后才知道它指向回环地址。"""
-        self.assertFalse(self._check("https://127.0.0.1.nip.io:8080")["ok"])
+        """`127.0.0.1.nip.io` 字面量完全正常，只有解析后才知道它指向回环地址。
+
+        解析结果**注入**而不依赖真实 DNS：`nip.io` 能否解析取决于运行环境的解析器，
+        靠真实 DNS 会让用例在离线 / 受限网络的 CI 上随机变红。
+        """
+        with mock.patch.object(nc, "resolves_to_local", return_value=True):
+            self.assertFalse(self._check("https://127.0.0.1.nip.io:8080")["ok"])
 
     def test_unparsable_input_rejected(self):
         for url in ("", "   ", "not a url"):

@@ -19,6 +19,10 @@ env/
 .coverage
 htmlcov/
 
+# 临时/探针文件与日志（仓库内 .tmp 与各类 *.log 一律不入库）
+.tmp/
+*.log
+
 # skill 的本地凭据与安装清单（绝不入库）
 **/.noova/
 **/.install-manifest.json
