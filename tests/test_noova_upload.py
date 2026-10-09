@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "noova-generation"
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
@@ -87,8 +88,14 @@ class ThirdpartyAParseTest(unittest.TestCase):
         self.assertEqual(nu.parse_thirdparty-a_response(payload), "https://img.thirdparty-a.ee/api/file/a.png")
 
     def test_absolute_direct_url_preserved(self):
+        """第三方返回的公网绝对直链原样保留。
+
+        固定 DNS 判定：接管解析器（如企业 DNS 把未知域名指到内网）的环境下，
+        `other-cdn.example.org` 会被解析成内网地址而遭拒，本用例测的是解析逻辑本身。
+        """
         payload = {"directUrl": "https://other-cdn.example.org/x.png"}
-        self.assertEqual(nu.parse_thirdparty-a_response(payload), "https://other-cdn.example.org/x.png")
+        with mock.patch.object(nu, "resolves_to_local", return_value=False):
+            self.assertEqual(nu.parse_thirdparty-a_response(payload), "https://other-cdn.example.org/x.png")
 
     def test_absolute_url_pointing_at_loopback_is_rejected(self):
         """第三方返回的地址不得让用户本机去 GET（`--verify` 会真的发请求）。"""

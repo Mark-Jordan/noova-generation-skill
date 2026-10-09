@@ -199,11 +199,15 @@ class ConfigStoreTest(IsolatedConfigCase):
 
     def test_base_url_default_and_override(self):
         self.assertEqual(noova_key.get_base_url(), noova_key.DEFAULT_BASE_URL)
-        run("base", "https://api.example.org/some/path")
+        # 固定 DNS 判定：接管解析器（如企业 DNS 把未知域名指到内网）的环境下，
+        # 自定义域名会被守卫当成内网地址拒掉，而本用例测的是「落盘/读回」这件事。
+        with mock.patch.object(nc, "resolves_to_local", return_value=False):
+            run("base", "https://api.example.org/some/path")
         self.assertEqual(noova_key.get_base_url(), "https://api.example.org")
 
     def test_clear_removes_key_but_keeps_base(self):
-        run("setup", "sk-abcdefg123", "--base-url", "https://api.example.org", "--no-verify")
+        with mock.patch.object(nc, "resolves_to_local", return_value=False):
+            run("setup", "sk-abcdefg123", "--base-url", "https://api.example.org", "--no-verify")
         code, out, _ = run("clear")
         self.assertEqual(code, 0)
         self.assertIn("已清除", out)
@@ -548,8 +552,15 @@ class BaseUrlGuardTest(unittest.TestCase):
     一个只有当前这台机器能访问的地址，在别处必然失败，现象却像「服务故障」。
     """
 
-    def _check(self, url: str) -> dict:
-        with mock.patch.dict(os.environ, {noova_key.ALLOW_LOCAL_ENV: ""}):
+    def _check(self, url: str, dns_verdict: "bool | None" = None) -> dict:
+        """跑一次守卫，并把 DNS 判定固定住。
+
+        `resolves_to_local()` 的真实结果取决于运行环境的解析器（企业 DNS / 公共 DNS / 
+        离线 CI 各不相同），不固定它会让本类用例在别人的机器上随机变红。
+        默认按「域名可解析到公网」处理；要测离线 / 通配 DNS 行为时显式传入。
+        """
+        with mock.patch.dict(os.environ, {noova_key.ALLOW_LOCAL_ENV: ""}), \
+             mock.patch.object(nc, "resolves_to_local", return_value=dns_verdict):
             return noova_key.check_base_url(url)
 
     def test_production_domain_allowed(self):
@@ -618,7 +629,8 @@ class BaseUrlGuardTest(unittest.TestCase):
         self.assertIn("https", result["reason"])
 
     def test_insecure_escape_hatch_is_case_insensitive(self):
-        with mock.patch.dict(os.environ, {"NOOVA_ALLOW_INSECURE_BASE_URL": "TRUE"}):
+        with mock.patch.dict(os.environ, {"NOOVA_ALLOW_INSECURE_BASE_URL": "TRUE"}), \
+             mock.patch.object(nc, "resolves_to_local", return_value=False):
             result = noova_key.check_base_url("http://ai.mycorp.cn")
         self.assertTrue(result["ok"])
         self.assertIn("NOOVA_ALLOW_INSECURE_BASE_URL", result["warning"])
@@ -647,9 +659,13 @@ class BaseUrlGuardTest(unittest.TestCase):
         解析结果**注入**而不依赖真实 DNS：`nip.io` 能否解析取决于运行环境的解析器，
         靠真实 DNS 会让用例在离线 / 受限网络的 CI 上随机变红。
         """
-        with mock.patch.object(nc, "resolves_to_local", return_value=True):
-            self.assertFalse(self._check("https://127.0.0.1.nip.io:8080")["ok"])
+        self.assertFalse(self._check("https://127.0.0.1.nip.io:8080", dns_verdict=True)["ok"])
 
+    def test_unresolved_host_is_allowed_with_a_warning(self):
+        """离线 / DNS 不可用时按格式放行，但必须给出提示（不静默通过）。"""
+        result = self._check("https://ai.mycorp.cn", dns_verdict=None)
+        self.assertTrue(result["ok"])
+        self.assertIn("未能解析", result["warning"])
     def test_unparsable_input_rejected(self):
         for url in ("", "   ", "not a url"):
             self.assertFalse(self._check(url)["ok"], repr(url))

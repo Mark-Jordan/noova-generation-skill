@@ -204,12 +204,22 @@ class BaseUrlBypassTest(unittest.TestCase):
         os.environ.update(self._saved)
         nc.clear_resolve_cache()
 
+    def _check(self, url: str, dns_verdict: "bool | None" = False) -> dict:
+        """跑一次守卫，并把 DNS 判定固定住。
+
+        `resolves_to_local()` 的真实结果取决于运行环境的解析器（企业 DNS / 公共 DNS /
+        离线 CI 各不相同），不固定它就会让本类用例在别人的机器上随机变红。
+        默认「解析到公网」（`False`）；要测离线用 `None`，要测通配 DNS 指向回环用 `True`。
+        """
+        with mock.patch.object(nc, "resolves_to_local", return_value=dns_verdict):
+            return nc.check_base_url(url)
+
     def test_trailing_dot_fqdn_is_caught(self):
         """修复前：`http://localhost.` → ok=True（getaddrinfo 解析到 127.0.0.1）。
 
         归一化后 `localhost.` → `localhost` 会被**字面量**判据拦下，不依赖 DNS。
         """
-        result = nc.check_base_url("http://localhost.")
+        result = self._check("http://localhost.")
         self.assertFalse(result["ok"])
         self.assertTrue(result["local"])
 
@@ -220,31 +230,30 @@ class BaseUrlBypassTest(unittest.TestCase):
         127.0.0.1 取决于运行环境的解析器，靠真实 DNS 会让用例在离线 /
         受限网络的 CI 上随机变红。被测的是「解析到回环时必须拦下」这一逻辑。
         """
-        with mock.patch.object(nc, "resolves_to_local", return_value=True):
-            self.assertFalse(nc.check_base_url("https://127.0.0.1.nip.io:8080")["ok"])
+        self.assertFalse(self._check("https://127.0.0.1.nip.io:8080", dns_verdict=True)["ok"])
 
     def test_userinfo_disguise_is_rejected(self):
         """`https://noova.vip@evil.example.com` 的真实 host 是 evil.example.com。"""
-        result = nc.check_base_url("https://noova.vip@evil.example.com")
+        result = self._check("https://noova.vip@evil.example.com")
         self.assertFalse(result["ok"])
         self.assertEqual(result["host"], "evil.example.com")
 
     def test_numeric_ip_shorthand_is_rejected(self):
         for url in ("http://2130706433", "http://0x7f000001", "http://0177.0.0.1"):
-            self.assertFalse(nc.check_base_url(url)["ok"], url)
+            self.assertFalse(self._check(url)["ok"], url)
 
     def test_plain_http_public_host_is_rejected(self):
         """Key 走 Authorization 头，明文链路等于泄露凭据。"""
-        result = nc.check_base_url("http://ai.mycorp.cn")
+        result = self._check("http://ai.mycorp.cn")
         self.assertFalse(result["ok"])
         self.assertFalse(result["secure"])
 
     def test_escape_hatches_are_case_insensitive(self):
         """修复前：`=TRUE` 静默不生效——安全开关「看起来开了其实没开」。"""
         with mock.patch.dict(os.environ, {nc.ALLOW_LOCAL_ENV: "TRUE"}):
-            self.assertTrue(nc.check_base_url("http://localhost:5001")["ok"])
+            self.assertTrue(self._check("http://localhost:5001")["ok"])
         with mock.patch.dict(os.environ, {nc.ALLOW_INSECURE_ENV: "TRUE"}):
-            self.assertTrue(nc.check_base_url("http://ai.mycorp.cn")["ok"])
+            self.assertTrue(self._check("http://ai.mycorp.cn")["ok"])
 
     def test_cross_origin_redirect_is_refused(self):
         """修复前：302 会把 Authorization 头原样复制到未校验的主机。"""

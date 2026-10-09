@@ -51,6 +51,10 @@ jobs:
           code=$?
           tail -40 unittest.log
           if [ $code -ne 0 ]; then
+            # 把失败用例名发成 check-run annotation（公开可读，无需 token 就能定位问题）
+            while IFS= read -r line; do
+              echo "::error title=unittest ${{ matrix.os }} py${{ matrix.python-version }}::$line"
+            done < <(grep -E '^(FAIL|ERROR):' unittest.log | head -20)
             {
               echo "## unittest 失败（${{ matrix.os }} / Python ${{ matrix.python-version }}）"
               echo '```'
@@ -68,6 +72,9 @@ jobs:
           code=$?
           tail -40 pytest.log
           if [ $code -ne 0 ]; then
+            while IFS= read -r line; do
+              echo "::error title=pytest ${{ matrix.os }} py${{ matrix.python-version }}::$line"
+            done < <(grep -E '^(FAILED|ERROR)' pytest.log | head -20)
             {
               echo "## pytest 失败（${{ matrix.os }} / Python ${{ matrix.python-version }}）"
               echo '```'
