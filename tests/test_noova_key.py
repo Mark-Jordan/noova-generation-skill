@@ -453,8 +453,9 @@ class ProbeTest(unittest.TestCase):
 class VerifyEndpointTest(unittest.TestCase):
     """回归：Key 校验必须走真正鉴权的接口。
 
-    实测 2026-09-29：`/api/v1/gateway/models` 与 `/v1/models` 对任何请求都返回 200
-    （连无效 Key 也放行），拿它们校验 Key 会把垃圾 Key 判成有效。
+    实测 2026-09-29：模型清单类接口对无效 Key 也返回 200，拿它们校验 Key
+    会把垃圾 Key 判成有效。因此校验只走专用接口（+ 积分接口回退），
+    且**不依赖模型清单接口的鉴权语义**——那个语义历史上变过几次。
     """
 
     def test_auth_and_public_endpoints_are_distinct(self):

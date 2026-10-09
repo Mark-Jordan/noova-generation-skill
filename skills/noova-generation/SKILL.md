@@ -5,7 +5,7 @@ license: MIT — see the LICENSE file in this repository.
 compatibility: "需要 Python ≥ 3.8（仅标准库，无第三方依赖）；运行时需能访问 https://noova.vip 或 https://noova.live。"
 metadata:
   author: NooVa AI
-  version: "1.9.0"
+  version: "1.9.1"
 ---
 
 # NooVa AI 生成调用（公开 API）

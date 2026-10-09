@@ -43,12 +43,11 @@
 `corrupt_config_files`），供排查用。
 **它不是必需的前置步骤**——直接生成即可，缺 Key 时脚本会自行拦截并打印引导块。
 
-> ⚠️ **不要用模型清单接口判断 Key 是否有效**：`/api/v1/gateway/models`、`/v1/models` 都**不应该**
-> 被拿来判定 Key（`/v1/models` 2026-10-06 起已改为需要有效 Key；`/api/v1/gateway/models`
-> 自 2026-10-07 起需**登录 token**、属对内控制台链路，本 skill 一律不访问）。
+> ⚠️ **不要用模型清单接口判断 Key 是否有效**：模型清单类接口（无论需要鉴权与否）都**不应该**
+> 被拿来判定 Key——它们要么不校验鉴权，要么与鉴权语义无关。
 > 唯一可用于校验的是 `POST /api/v1/gateway/validate-key`
 > （恒 200，看 `data.valid`），回退方案是 `GET /api/v1/credit`（无效 Key → 401）。
-> 脚本的 `verify` / `doctor` / `setup` 已按此实现。
+> 脚本的 `verify` / `doctor` / `setup` 已按此实现，**不需要**也不应该访问任何对内端点。
 
 ---
 

@@ -11,6 +11,19 @@
 
 ---
 
+## 1.9.1 — 2026-10-10
+
+**文档脱敏（无行为变更）**
+
+- `references/api-contracts.md`：删去内部链路的端点路径与字段说明（原先写明了
+  具体路径及其“含展示字段与接入文档、渠道与成本”）。现在只描述**对外**端点，
+  内部链路仅保留「不使用、不推断、不展开」的边界声明。
+- `references/troubleshooting.md`：把「不要用模型清单接口校验 Key」改为不依赖
+  该接口鉴权语义的表述（其鉴权行为历史上变过，写死结论会再次失准）。
+- 删去已下线端点的历史条目；脚本注释同步去除内部字段名。
+
+> 本版无任何行为变更；`noova_key.py` 的两个鉴权探针与全部调用路径保持不变。
+
 ## 1.9.0 — 2026-10-10
 
 **官方双域名支持（noova.vip 主域名 / noova.live 备用域名）**
@@ -36,8 +49,7 @@
   "平台为 SampleProt 提供非流式 `:generateContent` 路由"，属**失实断言**，已改为实测口径。
 - 明确**不做 sampleprot 流式**（不实现 `:streamGenerateContent`）；sampleprot 分支保留为
   契约驱动的前向兼容，正常不会触发。
-- `references/troubleshooting.md`：修正 `/api/v1/gateway/models` 的错误描述
-  （原写"公开只读"，实为**需登录 token 的对内链路**，自 2026-10-07 起）。
+- `references/troubleshooting.md`：修正模型清单接口的鉴权描述（原先称"公开只读"，实际随部署变更，已改为不依赖该语义的写法）。
 - 新增 frontmatter 字段 `compatibility`（运行环境要求）。
 
 ## 1.8.2 / 1.8.1 — 2026-10-06

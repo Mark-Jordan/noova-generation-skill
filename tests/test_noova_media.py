@@ -689,9 +689,9 @@ class UrlJoinTest(unittest.TestCase):
 class ResponseEnvelopeTest(unittest.TestCase):
     """平台响应有两种形态：裸业务体 与 `{code, data, message}` 统一包裹。
 
-    实测 2026-09-29：**所有**错误响应、`/api/v1/gateway/models`、`validate-key`、
-    `public-config` 的成功响应都是包裹形态。只认顶层字段会让「任务永远查不到终态」
-    伪装成「任务超时」——所以每个提取函数都必须对两种形态都成立。
+    实测 2026-09-29：**所有**错误响应与部分成功响应（如鉴权校验）都是包裹形态。
+    只认顶层字段会让「任务永远查不到终态」伪装成「任务超时」——
+    所以每个提取函数都必须对两种形态都成立。
     """
 
     ENVELOPE = {"code": 200, "data": {"status": "succeeded", "id": "t-1"}, "message": ""}

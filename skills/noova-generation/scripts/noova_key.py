@@ -92,7 +92,7 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 
 PACKAGE_NAME = "noova-generation"
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 
 # 脚本自身位置：用于生成「绝对路径命令」，避免提示里的相对路径在任意 cwd 下失效。
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -135,9 +135,9 @@ PUBLIC_PROBE_PATH = "/api/models"
 #                  无效 Key → `{"valid": false, "reason": "API Key 无效或已停用"}`。
 AUTH_VALIDATE_PATH = "/api/v1/gateway/validate-key"
 # 鉴权探针二（回退）：积分查询接口，**真正校验 Key**（无 Key / 无效 Key → 401）。
-# 实测 2026-09-29：`/api/v1/gateway/models` 忽略 Authorization（公开只读）；
-# 2026-10-06 起 `/v1/models` 也改为需要有效 Key（缺失/无效 → 401）。
 # 本 skill 统一用下面的 AUTH_PROBE_PATH 判 Key，不依赖模型清单接口。
+# 模型清单接口的鉴权语义曾多次变更（实测 2026-09-29 与 2026-10-07 不一致），
+# 所以任何依赖它的判断都是不稳定的；本模块只保留上面两个探针。
 AUTH_PROBE_PATH = "/api/v1/credit"
 
 CONFIG_DIR_ENV = "NOOVA_CONFIG_DIR"

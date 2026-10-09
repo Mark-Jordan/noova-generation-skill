@@ -23,6 +23,10 @@ htmlcov/
 .tmp/
 *.log
 
+# 本地备份（如历史重写前的 .git 副本）——绝不入库
+.tmp-backup*/
+*backup-repo*/
+
 # skill 的本地凭据与安装清单（绝不入库）
 **/.noova/
 **/.install-manifest.json
