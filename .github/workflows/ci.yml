@@ -51,10 +51,13 @@ jobs:
           code=$?
           tail -40 unittest.log
           if [ $code -ne 0 ]; then
-            # 把失败用例名发成 check-run annotation（公开可读，无需 token 就能定位问题）
+            # 把失败用例名与断言行发成 check-run annotation（公开可读，无需 token 就能定位问题）
             while IFS= read -r line; do
               echo "::error title=unittest ${{ matrix.os }} py${{ matrix.python-version }}::$line"
-            done < <(grep -E '^(FAIL|ERROR):' unittest.log | head -20)
+            done < <(grep -E '^(FAIL|ERROR):|^AssertionError|^[A-Za-z]*Error:' unittest.log | head -30)
+            while IFS= read -r line; do
+              echo "::error title=line ${{ matrix.os }}::$line"
+            done < <(grep -A 6 -E '^AssertionError' unittest.log | head -20)
             {
               echo "## unittest 失败（${{ matrix.os }} / Python ${{ matrix.python-version }}）"
               echo '```'

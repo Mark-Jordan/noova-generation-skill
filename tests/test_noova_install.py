@@ -186,7 +186,11 @@ class TargetDetectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = installer.resolve_target(installer.detect_targets(), tmp)
             self.assertEqual(target["kind"], "custom")
-            self.assertEqual(installer.install_dir(target), Path(tmp) / installer.PACKAGE_NAME)
+            # 比对**规范化后**的路径：`resolve_target()` 会对显式目录调 `resolve()`，
+            # 而 `resolve()` 在 Windows 上会把 8.3 短名（如 `RUNNER~1`）展开成长名。
+            # 直接比原始 `tmp` 会在 CI 的短名临时目录下误报（已实测）。
+            self.assertEqual(installer.install_dir(target).resolve(),
+                             (Path(tmp) / installer.PACKAGE_NAME).resolve())
 
     def test_keyword_target(self):
         targets = installer.detect_targets()
