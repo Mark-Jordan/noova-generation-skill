@@ -124,25 +124,9 @@ Content-Type: application/json
 
 **正文取值路径**：`content[].text` 拼接（可能有多个块，其中也可能含非文本块，跳过即可）。
 
-### SampleProt 协议模型（**平台当前未提供，以下仅存档官方协议形状**）
-
-```http
-POST /v1beta/models/<模型编码>:generateContent
-Authorization: Bearer <API_KEY>          # 亦兼容 x-sample-api-key
-Content-Type: application/json
-
-{ "contents": [{ "role": "user", "parts": [{ "text": "写一句品牌标语" }] }],
-  "systemInstruction": { "parts": [{ "text": "<可选>" }] },
-  "generationConfig": { "maxOutputTokens": 1024, "temperature": 0.7 } }
-```
-
-**正文取值路径**：`candidates[].content.parts[].text`。
-
-> **注意**：平台当前**不对外提供 SampleProt 协议**（实测 2026-10-09：34 个模型 0 个声明 `sampleprot`；
-> `sample-3.7-flash` 等 SampleProt 系模型的契约协议是 `openai` / `anthropic`）。本节描述的是 SampleProt
-> **官方协议形状**，仅供解析器前向兼容参考，现有模型用不到。
-> 三种协议的解析脚本都已内置，且对**不可用协议**会在发请求前即报错（不发必然失败的请求）。
-> 具体某模型支持哪些协议，用 `params --code <编码> --json` 的 `protocols` 字段确认。
+> **协议以运行时契约为准**：某模型支持哪些协议，用 `params --code <编码> --json` 的
+> `protocols` 字段确认。平台**只对外提供实际声明的协议**；请求未声明的协议时，
+> 脚本会在**发请求前**即报错并列出可用协议（不发必然失败的请求）。
 
 ---
 
@@ -284,8 +268,8 @@ data: {"type":"message_stop"}
 取值规则：
 
 - 逐行读取，只处理以 `data:` 开头的行（`event:` 行可忽略）；`data: [DONE]` 表示结束。
-- 增量文本：OpenAI 在 `choices[0].delta.content`；Anthropic 在 `delta.text`；SampleProt 在 `candidates[0].content.parts[].text`。
-- 用量（若有）在最后一个数据块里。三种方言脚本都已兼容。
+- 增量文本：OpenAI 在 `choices[0].delta.content`；Anthropic 在 `delta.text`。
+- 用量（若有）在最后一个数据块里。两种方言脚本都已兼容。
 
 命令行：`noova_media.py chat --prompt "..." --stream`（默认直接打印增量文本；
 加 `--json` 则逐条输出 SSE 事件原文，**但事件会先过一遍域名脱敏**——
@@ -295,7 +279,7 @@ agent 拿到的是可解析的 JSON 行，且不会把上游的内部域名转�
 
 ---
 
-## 5. 协议适配：OpenAI / Anthropic / SampleProt
+## 5. 协议适配：OpenAI / Anthropic
 
 **本 skill 的文本调用默认走协议原生路由**（用户指定 OpenAI 格式就发 OpenAI 路由、Anthropic 格式就发 Anthropic 路由），
 请求与响应都是该协议的**原样格式**，不做跨协议转换：
@@ -304,12 +288,11 @@ agent 拿到的是可解析的 JSON 行，且不会把上游的内部域名转�
 |---|---|---|---|
 | `openai` | `POST /v1/chat/completions` | `{model, messages[], stream?}` | `choices[0].message.content` |
 | `anthropic` | `POST /v1/messages` | `{model, max_tokens, messages[], system?, stream?}` | `content[].text`（拼接） |
-| `sampleprot`（**平台未提供**） | `POST /v1beta/models/<model>:generateContent` | `{contents:[{parts:[{text}]}]}` | `candidates[].content.parts[].text` |
 
 路由选择规则：
 
 - `chat`（不带 `--protocol`）→ 用该模型的**主协议**（契约里的 `protocols[0]`）。
-- `chat --protocol openai|anthropic|sampleprot` → 强制走该协议；模型不支持则**发请求前**报错并列出可用协议。
+- `chat --protocol openai|anthropic` → 强制走该协议；模型不支持则**发请求前**报错并列出可用协议。
 
 ```bash
 python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码> --json   # 看 protocols 字段
@@ -317,16 +300,10 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码> --json  
 
 补充说明：
 
-- 统一入口 `POST /api/v1/invoke` 存在且对文本模型同样可用（网关会把 Anthropic/SampleProt 响应转换回
+- 统一入口 `POST /api/v1/invoke` 存在且对文本模型同样可用（网关会把非 OpenAI 响应转换回
   OpenAI 形态），但**本 skill 不用于文本生成**——用户要什么格式就用什么格式的原生路由，少一层转换、语义更直白。
 - 图像 / 视频 / 音频**只有**统一入口这一条创建路由（公开文档未声明原生路由），故任务型仍走 `/api/v1/invoke`。
-- **平台当前不对外提供 `sampleprot` 协议**（实测 2026-10-09：34 个模型 0 个声明 `sampleprot`；
-  `sample-3.7-flash` / `sample-3.8-flash` 等 SampleProt 系模型的契约协议是 `openai` / `anthropic`，
-  即“SampleProt 系模型”走的是 OpenAI/Anthropic 报文）。后端虽保留
-  `/v1beta/models/<model>:generateContent` 路由（历史 a retired integration 图像模型兜底，当前无模型命中），
-  但 skill 不再把它当作可用协议呈现：`--protocol sampleprot` 对现有模型会在发请求前报“不支持”。
-  本 skill **明确不做 sampleprot 流式**；该分支仅为契约驱动的前向兼容，正常不会触发。
-- 脚本的文本解析器对三种协议的**响应与 SSE 方言都做了兼容**（即使某天响应形态变化也不会解析失败）。
+- 脚本的文本解析器对各协议的**响应与 SSE 方言都做了兼容**（即使某天响应形态变化也不会解析失败）。
 
 ---
 
@@ -339,16 +316,13 @@ python3 <SKILL_DIR>/scripts/noova_media.py upload --file ./photo.png
 # 输出即文件地址，把它传给生成参数；加 --json 可拿到 provider/verified 等元信息
 ```
 
-上传通道（默认 `--host auto`，按顺序尝试、失败自动降级）：
+上传通道（`--host auto`，默认）：
 
-| 顺序 | 通道 | 说明 |
-|---|---|---|
-| 1 | `thirdparty-a` | 第三方图床一；需浏览器指纹头（脚本已带）；图片与 ≤20MB 视频 |
-| 2 | `thirdparty-b` | 第三方图床二；无需额外头；不校验文件真实内容 |
-| 3 | `platform` | 平台自有存储通道；**需要 API Key**（未配置 Key 时自动跳过） |
+| 通道 | 说明 |
+|---|---|
+| `platform` | 平台自有存储通道；**需要 API Key** |
 
-> 前两个是**第三方免费图床，非平台自有服务**：可能被清理、链接失效、内容不校验。
-> **禁止上传敏感或重要数据**。需要可靠存放时用 `--host platform`（需 Key）。
+> 素材只上传到**平台自有存储**，不经手任何第三方服务；需先完成 API Key 配置。
 
 生成命令支持**直接给本地路径**（脚本内部自动完成上传）：
 

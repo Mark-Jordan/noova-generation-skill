@@ -272,7 +272,7 @@ class CreditCostTest(unittest.TestCase):
         self.assertEqual(nm.compute_credit_cost(model, {})["credits"], 50.0)
 
     def test_surcharge_multiply_by_value(self):
-        """生产 `demo-video-2.5-720p-kd`：price=0，duration ×60 积分。"""
+        """按用量计价的模型：price=0，duration ×60 积分。"""
         model = spec_model(
             billing={"mode": "per_request", "price": 0.0, "unit": 1},
             surchargeRules=[{"param": "duration", "match": "present",
@@ -403,7 +403,7 @@ class BaseUrlGuardTest(unittest.TestCase):
         # 备用官方域名同样是公开域名
         for host in ("noova.live", "www.noova.live", "www.noova.vip"):
             self.assertTrue(nm._host_is_public(host), host)
-        # 上传白名单里的第三方图床由调用方显式传入，同样被认可为公开
+        # 上传主机由调用方显式传入时同样被认可为公开
         allowed = nm._public_hosts()
         for host in allowed:
             self.assertTrue(nm._host_is_public(host, allowed), host)
@@ -427,10 +427,6 @@ class ExtractTextTest(unittest.TestCase):
         payload = {"content": [{"type": "text", "text": "原生"}, {"type": "text", "text": "响应"}]}
         self.assertEqual(nm.extract_text(payload), "原生响应")
 
-    def test_sampleprot(self):
-        payload = {"candidates": [{"content": {"parts": [{"text": "gem"}, {"text": "ini"}]}}]}
-        self.assertEqual(nm.extract_text(payload), "sampleprot")
-
     def test_responses_api(self):
         payload = {"output": [{"content": [{"type": "output_text", "text": "resp"}]}]}
         self.assertEqual(nm.extract_text(payload), "resp")
@@ -452,10 +448,6 @@ class ExtractStreamDeltaTest(unittest.TestCase):
     def test_anthropic_non_delta_event_ignored(self):
         self.assertEqual(nm.extract_stream_delta({"type": "message_start"}), "")
 
-    def test_sampleprot_chunk(self):
-        chunk = {"candidates": [{"content": {"parts": [{"text": "g"}]}}]}
-        self.assertEqual(nm.extract_stream_delta(chunk), "g")
-
 
 class ExtractUsageTest(unittest.TestCase):
     def test_openai(self):
@@ -466,10 +458,6 @@ class ExtractUsageTest(unittest.TestCase):
         usage = nm.extract_usage({"usage": {"input_tokens": 7, "output_tokens": 3}})
         self.assertEqual(usage["prompt_tokens"], 7)
         self.assertEqual(usage["completion_tokens"], 3)
-
-    def test_sampleprot(self):
-        usage = nm.extract_usage({"usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 6}})
-        self.assertEqual(usage["total_tokens"], 10)
 
     def test_absent(self):
         self.assertEqual(nm.extract_usage({"id": "x"}), {})
@@ -533,7 +521,7 @@ class PriceTextTest(unittest.TestCase):
         self.assertIn("缓存写入 30", text)
 
     def test_zero_price_with_rules_says_usage_based(self):
-        """实测 `demo-video-2.5-720p-kd`：price=0，由加收规则按秒计价。
+        """按用量计价的模型：price=0，由加收规则按秒计价。
 
         渲染成「0 积分/次」会让用户以为免费，必须说成「按用量计价」。
         """
@@ -839,34 +827,6 @@ class ChatProtocolRouteTest(unittest.TestCase):
         body = nm.build_chat_body("responses", "m", args, [])
         self.assertEqual(body["max_output_tokens"], 64)
         self.assertEqual(body["instructions"], "sys")
-
-    def test_sampleprot_route_interpolates_model(self):
-        self.assertEqual(nm.resolve_route_path("sampleprot", "g x"),
-                         "/v1beta/models/g%20x:generateContent")
-
-    def test_sampleprot_route_is_not_streaming(self):
-        """本 skill 不做 sampleprot 流式：路由固定为非流式的 `:generateContent`。
-
-        （平台另有 `:streamGenerateContent`，但那不是本 skill 的选择——见 SKILL.md
-        与 protocols.md「平台当前不对外提供 sampleprot 协议」。）
-        """
-        self.assertNotIn("streamGenerateContent", nm.resolve_route_path("sampleprot", "m"))
-
-    def test_sampleprot_stream_fails_loudly_instead_of_degrading_silently(self):
-        """`chat --protocol sampleprot --stream` 必须报错：静默非流式会让用户误以为流式生效。"""
-        parser = nm.build_parser()
-        args = parser.parse_args(["chat", "--prompt", "hi", "--protocol", "sampleprot", "--stream"])
-        with self.assertRaises(nm.NoovaError) as ctx:
-            nm.build_chat_body("sampleprot", "m", args, [])
-        self.assertIn("不支持流式", str(ctx.exception))
-        self.assertTrue(ctx.exception.hint, "必须给出可行的替代做法，而不是只报错")
-
-    def test_sampleprot_without_stream_still_builds_a_valid_body(self):
-        """拒绝流式不得误伤普通调用。"""
-        parser = nm.build_parser()
-        args = parser.parse_args(["chat", "--prompt", "hi", "--protocol", "sampleprot"])
-        self.assertEqual(nm.build_chat_body("sampleprot", "m", args, []),
-                         {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})
 
     def test_unknown_protocol_has_no_route(self):
         self.assertEqual(nm.resolve_route_path("bogus", "m"), "")
@@ -1185,8 +1145,8 @@ class ListingWidthRegressionTest(unittest.TestCase):
 
     实测过的真实缺陷：计价单元格逐行重复「输入 X / 输出 Y 积分/百万 tokens」时，
     文本模型每一行 104–107 列 ⇒ 终端折行把整张表拆散，列对齐全废。
-    fixtures 取线上真实出现过的**最长字段组合**（demo-text-5.5 / anthropic+openai /
-    520-2650），保证这条断言真能拦住回归，而不是靠小样例假通过。
+    fixtures 取线上真实出现过的**最长字段组合**（最长编码 / anthropic+openai 双协议 /
+    520-2650 计价），保证这条断言真能拦住回归，而不是靠小样例假通过。
     """
 
     LONG = [
@@ -1392,8 +1352,7 @@ class FormPanelTest(unittest.TestCase):
 
     def _models(self):
         return [nm._normalize_model(item) for item in (
-            # 同名 + 同编码族、两条不同线路：这是生产真实形状
-            # （3 个「Demo Image 2.5」、4 个「Demo Video 2.5」）
+            # 同名 + 同编码族、两条不同线路：这是生产真实形状（同一展示名多条编码）
             self._raw("img-a", name="Demo Image", params=self.IMAGE_PARAMS,
                       line="特价1K-flare"),
             self._raw("img-c", name="Demo Image", price=20.0, line="1K线路-特价"),
@@ -1437,7 +1396,7 @@ class FormPanelTest(unittest.TestCase):
         self.assertIn("编码", reasons["Mystery"])
 
     def test_model_panel_carries_code_and_price_for_every_option(self):
-        """同名模型确实存在（生产 3 个「Demo Image 2.5」），只给名字用户没法区分。
+        """同名模型确实存在（同一展示名对应多条编码），只给名字用户没法区分。
 
         区分依据是**线路 + 模型编码 + 计价**三件套；面板还必须先给出该线路的
         近似消耗（参数还没定，所以是区间或定性），否则用户得先选完才知道多少钱。
@@ -1724,7 +1683,7 @@ class LineListingTest(unittest.TestCase):
     """
 
     SPECS = [
-        {"model": "sd-a", "displayName": "Demo Video 2.5", "modelType": "video",
+        {"model": "vd-a", "displayName": "Demo Video 2.5", "modelType": "video",
          "line": "满血720p-0.6/s", "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
@@ -1733,7 +1692,7 @@ class LineListingTest(unittest.TestCase):
          "params": [{"name": "prompt", "type": "string", "required": True},
                     {"name": "duration", "type": "number", "required": True,
                      "min": 4, "max": 15}]},
-        {"model": "sd-b", "displayName": "Demo Video 2.5", "modelType": "video",
+        {"model": "vd-b", "displayName": "Demo Video 2.5", "modelType": "video",
          "line": "性价比-0.25/s", "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
@@ -1794,11 +1753,11 @@ class LineListingTest(unittest.TestCase):
     def test_json_carries_line_family_and_approximate_credit(self):
         items = json.loads(self._render(["models", "--json"]))
         by_code = {item["model_code"]: item for item in items}
-        self.assertEqual(by_code["sd-a"]["line"], "满血720p-0.6/s")
-        self.assertEqual(by_code["sd-a"]["line_label"], "满血720p-0.6/s")
-        self.assertEqual(by_code["sd-a"]["family"], "video:Demo Video 2.5")
-        self.assertEqual(by_code["sd-b"]["family"], by_code["sd-a"]["family"])
-        self.assertEqual(by_code["sd-a"]["approximate_credit"]["kind"], "range")
+        self.assertEqual(by_code["vd-a"]["line"], "满血720p-0.6/s")
+        self.assertEqual(by_code["vd-a"]["line_label"], "满血720p-0.6/s")
+        self.assertEqual(by_code["vd-a"]["family"], "video:Demo Video 2.5")
+        self.assertEqual(by_code["vd-b"]["family"], by_code["vd-a"]["family"])
+        self.assertEqual(by_code["vd-a"]["approximate_credit"]["kind"], "range")
         self.assertEqual(by_code["plain"]["line"], "")
         self.assertEqual(by_code["plain"]["line_label"], "默认")
         self.assertEqual(by_code["plain"]["approximate_credit"]["kind"], "exact")
@@ -1814,18 +1773,18 @@ class ModelFormLineTest(unittest.TestCase):
             "line": line, "status": "online", "protocols": ["openai"],
             "billing": {"mode": "per_request", "price": price, "unit": 1},
             "surchargeRules": [], "params": []})
-            for code, line, price in (("sd-std", "官方渠道720p-0.25/s", 25.0),
-                                      ("sd-kd", "满血720p-0.6/s", 60.0))]
+            for code, line, price in (("vd-std", "官方渠道720p-0.25/s", 25.0),
+                                      ("vd-kd", "满血720p-0.6/s", 60.0))]
 
     def test_every_option_carries_line_and_approximate_credit(self):
         panel = nm.build_model_form("video", self._models())
         by_code = {o["value"]: o for o in panel["options"]}
-        self.assertEqual(by_code["sd-std"]["line_label"], "官方渠道720p-0.25/s")
-        self.assertEqual(by_code["sd-kd"]["line_label"], "满血720p-0.6/s")
-        self.assertEqual(by_code["sd-std"]["credit_estimate"], "25 积分/次")
-        self.assertEqual(by_code["sd-kd"]["credit_estimate"], "60 积分/次")
-        self.assertEqual(by_code["sd-std"]["family"], "video:Demo Video 2.5")
-        self.assertNotIn("・", by_code["sd-std"]["credit_estimate"])   # 短文案不带依据
+        self.assertEqual(by_code["vd-std"]["line_label"], "官方渠道720p-0.25/s")
+        self.assertEqual(by_code["vd-kd"]["line_label"], "满血720p-0.6/s")
+        self.assertEqual(by_code["vd-std"]["credit_estimate"], "25 积分/次")
+        self.assertEqual(by_code["vd-kd"]["credit_estimate"], "60 积分/次")
+        self.assertEqual(by_code["vd-std"]["family"], "video:Demo Video 2.5")
+        self.assertNotIn("・", by_code["vd-std"]["credit_estimate"])   # 短文案不带依据
 
     def test_line_legend_appears_only_when_a_model_has_several_lines(self):
         multi = nm.build_model_form("video", self._models())

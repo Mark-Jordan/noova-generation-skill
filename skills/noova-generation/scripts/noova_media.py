@@ -39,7 +39,7 @@
 端点选择
 --------
 - **文本模型**：按模型自身协议走官方原生路由 —— `anthropic` → `/v1/messages`，
-  `openai` → `/v1/chat/completions`（平台当前实测只有这两类；sampleprot/responses 为前向兼容分支）。
+  `openai` → `/v1/chat/completions`（平台当前实测只有这两类；其它分支为前向兼容）。
   不使用统一入口；路由以参数契约的 `protocols[0]`（主协议）为准。
 - **图像/视频/音频**：统一创建接口 `POST /api/v1/invoke`，创建后用 `POST /v1/content` 轮询。
 
@@ -53,10 +53,10 @@
 常用示例（命令前缀用当前解释器绝对路径，见 `PYTHON_CMD`）
 --------
   <PYTHON> noova_media.py models --type image
-  <PYTHON> noova_media.py params --code demo-image-pro --json
+  <PYTHON> noova_media.py params --code <模型编码> --json
   <PYTHON> noova_media.py image --prompt "一只戴墨镜的猫"
-  <PYTHON> noova_media.py video --prompt "夕阳下的城市天际线" --model demo-video-rt --param duration=5
-  <PYTHON> noova_media.py chat  --prompt "写一句品牌标语" --model demo-text-5.5
+  <PYTHON> noova_media.py video --prompt "夕阳下的城市天际线" --model <模型编码> --param duration=5
+  <PYTHON> noova_media.py chat  --prompt "写一句品牌标语" --model <模型编码>
   <PYTHON> noova_media.py chat  --prompt "写一段介绍" --stream
   <PYTHON> noova_media.py upload --file ./photo.png
 """
@@ -109,7 +109,6 @@ from noova_common import (  # noqa: E402
 from noova_upload import (  # noqa: E402
     ALL_HOSTS as UPLOAD_HOSTS,
     HOST_LABELS as UPLOAD_HOST_LABELS,
-    PUBLIC_UPLOAD_HOSTS,
     UploadError,
     safe_filename,
     upload_file,
@@ -139,21 +138,18 @@ KEY_CMD = python_cmd(KEY_SCRIPT)
 SELF_CMD = python_cmd(SELF_SCRIPT)
 
 # 平台公开的「官方接入路由」映射：模型协议 → 用户侧请求路径。
-# 与平台模型文档「官方接入路由（X，推荐）」小节对齐。平台当前实测只出现 openai / anthropic
-#（2026-10-09：34 个模型，0 个声明 sampleprot；sampleprot-* 命名模型走 openai/anthropic）；
-# sampleprot 保留映射仅为契约驱动的前向兼容。
+# 与平台模型文档「官方接入路由（X，推荐）」小节对齐。平台当前实测只出现 openai / anthropic。
 PROTOCOL_PATHS = {
     "openai": "/v1/chat/completions",
     "anthropic": "/v1/messages",
-    "sampleprot": "/v1beta/models/{model}:generateContent",
-    # 平台确实注册了该路由（2026-09-29 实测：POST → 400「请求体缺少 model」，非 404）。
+    # 平台确实注册了该路由（实测：POST → 400「请求体缺少 model」，非 404）。
     # 当前公开模型文档均未把 Responses 声明为接入路由，故默认不会被选中；
     # 这里保留映射，是为了将来某模型文档声明「官方接入路由（Responses）」时能被正确识别，
     # 而不是被静默丢弃。
     "responses": "/v1/responses",
 }
 PROTOCOL_LABELS = {"openai": "OpenAI", "anthropic": "Anthropic",
-                   "sampleprot": "SampleProt", "responses": "OpenAI Responses"}
+                   "responses": "OpenAI Responses"}
 
 # 任务型（图像/视频/音频）创建入口：平台文档对该类型模型给出的创建路由。
 TASK_CREATE_PATH = "/api/v1/invoke"
@@ -267,18 +263,15 @@ class NoovaError(Exception):
 # ---------------------------------------------------------------------------
 # 脱敏：实现已下沉到 `noova_common`（单一来源）
 # ---------------------------------------------------------------------------
-# 这里只保留 `_safe()`：它负责把「当前生效的基础域名 + 公开的第三方图床主机」
-# 加进公开白名单。判据本身（哪些主机算非公开、如何处理大小写/裸主机名/控制字符）
+# 这里只保留 `_safe()`：它负责把「当前生效的基础域名」加进公开白名单。
+# 判据本身（哪些主机算非公开、如何处理大小写/裸主机名/控制字符）
 # 全在 `noova_common.sanitize_text()`——曾经的本地实现被 `HTTPS://internal.corp/x`
 # 这类大写 scheme 绕过（已实测）。
 
 
 def _public_hosts() -> tuple[str, ...]:
-    """把当前生效的基础域名与公开的第三方上传主机视为公开（不做占位替换）。
-
-    第三方图床主机名来自平台公开的「素材上传」接口文档，属公开信息。
-    """
-    hosts: list[str] = list(PUBLIC_UPLOAD_HOSTS)
+    """把当前生效的基础域名视为公开（不做占位替换）。"""
+    hosts: list[str] = []
     try:
         host = urllib.parse.urlparse(get_base_url()).hostname or ""
         if host:
@@ -665,7 +658,10 @@ def _fetch_public_models(*, refresh: bool = False) -> list[dict]:
 
 
 def resolve_route_path(protocol: str, model_code: str) -> str:
-    """协议 → 用户侧官方路由路径（sampleprot 需插值模型名）。"""
+    """协议 → 用户侧官方路由路径（如需插值模型名，由路由模板占位符决定）。
+
+    `model_code` 保留为参数：路由模板可能含 `{model}` 占位符（见 `PROTOCOL_PATHS`）。
+    """
     template = PROTOCOL_PATHS.get(str(protocol or "").strip().lower())
     if not template:
         return ""
@@ -726,7 +722,7 @@ def model_family_key(model: dict) -> str:
 def build_model_families(models: list[dict]) -> list[dict]:
     """按「类型 + 显示名」把模型聚成族，族内即该模型的全部线路。
 
-    为什么要聚：生产真实存在同名多线路（`Demo Image 2.5` ×3、`Demo Video 2.5` ×4），
+    为什么要聚：生产真实存在同名多线路（同一展示名对应多条编码），
     平铺清单里它们混在一起，用户看不出「这是同一个模型的几条线路」。
 
     族内按线路标签稳定排序（同标签时按编码兜底），保证多次运行顺序一致。
@@ -887,7 +883,7 @@ def _select_by_code(models: list[dict], code: str) -> dict | None:
     由调用方在清单里标为不可用，而不是在这里猜一个编码出来。
 
     **显示名命中多条时 fail-closed**：生产真实存在同名多线路
-    （`Demo Image 2.5` ×3、`Demo Video 2.5` ×4），旧实现静默取第一条，
+    （同一展示名对应多条编码），旧实现静默取第一条，
     等于用户指定了名字却拿到一条随机线路、且毫不知情。这里改为报错并列出
     候选（编码 + 线路 + 计价），把选择权交回用户。
     """
@@ -979,7 +975,7 @@ def extract_text(payload: object) -> str:
 
 
 def _extract_text_from(payload: object) -> str:
-    """从**单个业务体**提取正文（OpenAI / Anthropic / SampleProt / Responses 四种形态）。"""
+    """从**单个业务体**提取正文（兼容各协议原生响应形态）。"""
     if not isinstance(payload, dict):
         return ""
     # OpenAI 兼容：choices[].message.content / choices[].text
@@ -1006,20 +1002,6 @@ def _extract_text_from(payload: object) -> str:
         ]
         if any(c.strip() for c in chunks):
             return "".join(chunks)
-    # SampleProt：candidates[].content.parts[].text
-    candidates = payload.get("candidates")
-    if isinstance(candidates, list):
-        chunks = []
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            parts = (candidate.get("content") or {}).get("parts") if isinstance(
-                candidate.get("content"), dict) else None
-            for part in parts or []:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    chunks.append(part["text"])
-        if any(c.strip() for c in chunks):
-            return "".join(chunks)
     # Responses API：output[].content[].text
     output = payload.get("output")
     if isinstance(output, list):
@@ -1036,7 +1018,7 @@ def _extract_text_from(payload: object) -> str:
 
 
 def extract_usage(payload: object) -> dict:
-    """提取用量（用于向用户解释计费）；兼容统一包裹与 OpenAI / Anthropic / SampleProt 字段名。"""
+    """提取用量（用于向用户解释计费）；兼容统一包裹与各协议字段名。"""
     for node in (payload, _unwrap(payload)):
         usage = _extract_usage_from(node)
         if usage:
@@ -1066,7 +1048,7 @@ def _extract_usage_from(payload: object) -> dict:
 
 
 def extract_stream_delta(payload: object) -> str:
-    """从单个 SSE 数据块中提取增量文本（OpenAI / Anthropic / SampleProt / Responses 四种方言）。"""
+    """从单个 SSE 数据块中提取增量文本（兼容各协议方言）。"""
     if not isinstance(payload, dict):
         return ""
     # OpenAI: choices[].delta.content
@@ -1093,8 +1075,8 @@ def extract_stream_delta(payload: object) -> str:
         delta = payload.get("delta")
         if isinstance(delta, str):
             return delta
-    # SampleProt: candidates[].content.parts[].text
-    return extract_text(payload) if payload.get("candidates") else ""
+    # 兼容协议原生响应：正文可能在更深的嵌套里
+    return extract_text(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1162,7 +1144,7 @@ def collect_result_urls(payload: object) -> list[str]:
       - `{"result": "…", "results": [{"url": "…", "content": "…"}], "videoUrl": "…"}`
       - `{"code": 200, "data": {"results": [...]}, "message": ""}` ← 统一包裹
 
-    第三方图床与平台存储的主机名**不在**公开域名白名单里，所以这里不能用
+    上传存储与平台存储的主机名**不在**公开域名白名单里，所以这里不能用
     `host_is_public()` 当门槛——那样会把用户的产物地址一起替换掉。只拦本机/内网。
     """
     urls: list[str] = []
@@ -2158,13 +2140,9 @@ def _invocation_spec(model: dict) -> dict:
         primary = "openai"
 
     if model["model_type"] in SYNC_MODEL_TYPES:
-        # 平台当前不对外提供 sampleprot 协议（实测 0 个模型声明；sampleprot-* 命名模型走 openai/anthropic），
-        # 该分支仅为「契约驱动」的前向兼容，正常不会触发。
-        # sampleprot 一律报 stream_supported=false —— 本 skill 明确不做 sampleprot 流式；
-        # 将来若要支持，须先改用 `:streamGenerateContent` 端点，再放开此项。
         routes = [{"protocol": p, "path": resolve_route_path(p, model["code"]),
                    "recommended": p == primary,
-                   "stream_supported": p != "sampleprot",
+                   "stream_supported": True,
                    "response_format": "该协议原生响应格式"} for p in protocols]
         primary_route = next((r for r in routes if r["protocol"] == primary), routes[0] if routes else None)
         return {
@@ -2488,7 +2466,7 @@ def build_model_form(model_type: str, models: list[dict]) -> dict:
         # 各自是独立编码，**必须让用户明确选一条**再进参数。
         payload["line_legend"] = "同一模型的多条线路计价不同，请让用户明确选一条"
     if duplicated:
-        # 实测同名模型确实存在（生产 3 个「Demo Image 2.5」、4 个「Demo Video 2.5」）。
+        # 实测同名模型确实存在（同一展示名对应多条编码）。
         # 契约里的 `line` 只说明"是哪条线路"，**不保证唯一、也不可用于计价**
         # （同一 `line` 文本会在不同模型上复现，且数字后缀会与真实单价漂移）。
         # 唯一可靠的选择键是**模型编码**——必须把线路、编码、计价三者一起摆出来。
@@ -2774,8 +2752,7 @@ def _ensure_required_params(model: dict, args, *, kind: str = "media") -> None:
     """发请求前核对「必填参数」是否已提供。
 
     依据是对外参数契约里的 `required` 标记，不硬编码任何模型。
-    实测 2026-09-29：12 个媒体模型里有 3 个把 `referenceImages` 标为**必填**
-    （`Demo Image 2.5 flare` / `Demo Image 2.5 sunburst` / `demo-video-2.0-mini-720p`），
+    实测：部分媒体模型会把 `referenceImages` 标为**必填**，
     缺了它发请求会白等一轮（耗时、可能计费）才拿到上游 400。这里提前拦下并说清缺什么。
     """
     params = model.get("params") or []
@@ -2878,7 +2855,6 @@ def build_chat_body(protocol: str, model_code: str, args, images: list[str]) -> 
     原生路由是透传语义（请求按协议官方格式直达上游），因此必须构造该协议的合法报文：
     - OpenAI：`{model, messages[{role, content}]}`
     - Anthropic：`{model, max_tokens, system?, messages[{role, content}]}`（`max_tokens` 必填）
-    - SampleProt：`{contents[{role, parts}], systemInstruction?, generationConfig?}`
     """
     if protocol == "anthropic":
         body: dict = {
@@ -2892,31 +2868,6 @@ def build_chat_body(protocol: str, model_code: str, args, images: list[str]) -> 
             body["temperature"] = float(args.temperature)
         if args.stream:
             body["stream"] = True
-        return body
-
-    if protocol == "sampleprot":
-        if args.stream:
-            # 静默降级是最坏的结果：用户以为拿到了流式，实际是一次性返回。
-            # 本 skill 明确不做 sampleprot 协议（平台当前无模型声明它），也不实现其流式
-            #（若将来要支持，须改用 `:streamGenerateContent` 端点）；这里直接报错而非降级。
-            raise NoovaError(
-                "SampleProt 协议暂不支持流式输出（--stream）",
-                hint="改用该模型的其它协议路由：去掉 --stream，或加 --protocol openai|anthropic",
-            )
-        if images:
-            raise NoovaError("SampleProt 协议路由暂不支持图片输入",
-                             hint="可改用该模型的其它协议路由，或去掉 --image")
-        parts: list[dict] = [{"text": args.prompt}]
-        body = {"contents": [{"role": "user", "parts": parts}]}
-        if args.system:
-            body["systemInstruction"] = {"parts": [{"text": args.system}]}
-        generation: dict = {}
-        if args.max_tokens:
-            generation["maxOutputTokens"] = int(args.max_tokens)
-        if args.temperature is not None:
-            generation["temperature"] = float(args.temperature)
-        if generation:
-            body["generationConfig"] = generation
         return body
 
     if protocol == "responses":
@@ -3187,8 +3138,8 @@ def upload_local_file(path: Path, key: str = "", *, content_type: str | None = N
                       timeout: int = 180, host: str = "auto") -> dict:
     """上传本地文件，返回 `{"url","provider","bytes","content_type"}`。
 
-    通道顺序由 `noova_upload` 决定：第三方图床一 → 第三方图床二 → 平台存储通道。
-    平台通道需要 API Key；未配置 Key 时自动跳过（前两个通道无需 Key）。
+    通道由 `noova_upload` 决定：平台存储通道。
+    需要 API Key；未配置 Key 时拒绝上传并给出配置引导。
     """
     try:
         return upload_file(path, api_key=key or get_api_key(), content_type=content_type,
@@ -3258,9 +3209,7 @@ def _platform_upload(path: Path, content_type: str, timeout: int) -> str:
 
 
 def cmd_upload(args) -> int:
-    """上传本地素材：默认按「图床一 → 图床二 → 平台存储」顺序自动降级。
-
-    第三方图床为免费服务，可能限速/失效；全部失败时才回退平台存储通道（需 API Key）。
+    """上传本地素材：走平台存储通道（需 API Key）。
     """
     path = Path(args.file).expanduser()
     if not path.is_file():
@@ -3268,7 +3217,7 @@ def cmd_upload(args) -> int:
     if path.stat().st_size <= 0:
         raise NoovaError("文件内容为空，无法上传")
 
-    key = get_api_key()  # 平台兜底通道需要；缺失时不阻断前两个通道
+    key = get_api_key()  # 平台存储通道需要
     result = upload_local_file(path, key, content_type=args.content_type,
                                timeout=args.timeout, host=args.host)
 
@@ -3278,7 +3227,7 @@ def cmd_upload(args) -> int:
         verified, verify_detail = verify_url(result["url"], timeout=min(int(args.timeout), 30))
         if not verified:
             print(f"[提示] 上传完成，但地址探测未通过（{verify_detail}）；"
-                  "第三方图床可能限流或已清理该文件，可重试。", file=sys.stderr)
+                  "可稍后重试或检查凭证是否过期。", file=sys.stderr)
 
     if args.json:
         print(_dump_json({
@@ -3296,7 +3245,7 @@ def cmd_upload(args) -> int:
     print(f"[已上传] {path.name}（{result['bytes']} 字节，{result['content_type']}）；"
           f"通道：{label}；校验：{'通过' if verified else (verify_detail or '未校验')}",
           file=sys.stderr)
-    print("[提示] 第三方图床为免费服务，长期有效性无保证；重要素材建议随用随传。", file=sys.stderr)
+    print("[提示] 上传产物由平台存储托管；重要素材建议随用随传。", file=sys.stderr)
     return 0
 
 
@@ -3340,9 +3289,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="NooVa AI 公开 API 标准调用封装（只访问公开接口）",
         epilog="示例：\n"
                "  noova_media.py models --type video\n"
-               "  noova_media.py params --code demo-video-rt --json\n"
+               "  noova_media.py params --code <模型编码> --json\n"
                "  noova_media.py image --prompt \"一只戴墨镜的猫\"\n"
-               "  noova_media.py chat --prompt \"写一句标语\" --model demo-text-5.5\n",
+               "  noova_media.py chat --prompt \"写一句标语\" --model <模型编码>\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"{PACKAGE_NAME} {CLIENT_VERSION}")
@@ -3406,7 +3355,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--protocol", choices=["auto", *PROTOCOL_PATHS.keys()],
                         default="auto",
                         help="auto=按该模型主协议自动选择官方路由（推荐）；"
-                             "openai/anthropic/sampleprot/responses=强制走该协议的官方路由（需模型支持）")
+                             "openai/anthropic/responses=强制走该协议的官方路由（需模型支持）")
     p_chat.add_argument("--show-usage", action="store_true",
                         help="输出用量与积分信息（token 用量、本次扣减、剩余积分）；"
                              "一律写到标准错误，不污染正文")
@@ -3438,12 +3387,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_wait.set_defaults(func=cmd_wait)
 
     p_upload = sub.add_parser(
-        "upload", help="上传本地素材，得到可被生成接口引用的 URL（自动降级：图床一 → 图床二 → 平台存储）")
+        "upload", help="上传本地素材，得到可被生成接口引用的 URL（平台存储通道，需 API Key）")
     p_upload.add_argument("--file", required=True, help="本地文件路径")
     p_upload.add_argument("--content-type", help="覆盖内容类型（默认按扩展名推断）")
     p_upload.add_argument("--host", choices=["auto", *UPLOAD_HOSTS], default="auto",
-                          help="上传通道：auto=依次尝试并自动降级（默认）；"
-                               "thirdparty-a/thirdparty-b=只用指定免费图床；platform=只用平台存储通道（需 API Key）")
+                          help="上传通道：auto / platform = 平台存储通道（需 API Key）")
     p_upload.add_argument("--timeout", type=int, default=180, help="上传超时秒数")
     p_upload.add_argument("--no-verify", dest="verify", action="store_false", default=True,
                           help="跳过上传后的地址可达性校验（默认会校验一次）")

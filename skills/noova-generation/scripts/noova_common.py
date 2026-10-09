@@ -396,8 +396,8 @@ class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
 class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
     """允许跨源重定向，但**拒绝跳到本机 / 内网地址**。
 
-    用于第三方图床与上传结果地址的校验：这些服务可能正常跳转到别的公网域名
-    （CDN），不能一律拒绝；但也不能让第三方返回的地址把用户本机当成探测跳板
+    用于上传结果地址的校验：这些地址可能正常跳转到别的公网域名
+    （CDN），不能一律拒绝；但也不能让响应返回的地址把用户本机当成探测跳板
     （SSRF）。判定含 DNS 解析，因此 `127.0.0.1.nip.io` 这类写法同样拦得住。
     """
 

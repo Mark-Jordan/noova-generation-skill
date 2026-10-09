@@ -56,7 +56,7 @@ Agent：[类型面板] 图像 / 视频 / 音频 / 文本  → 用户选「图像
 
 **适用**：你要在 NooVa 平台上生成内容，或查询只有该平台能回答的实时事实（有哪些模型、某个模型能填哪些参数、还剩多少积分）。
 
-**不适用**：回答模型本身的知识问题（例如「SampleModel 官方支持哪些分辨率」）—— 那属于上游模型的官方文档，本 skill 不含这类知识，也不该用它来回答。
+**不适用**：回答模型本身的知识问题（例如「某模型官方支持哪些分辨率」）—— 那属于上游模型的官方文档，本 skill 不含这类知识，也不该用它来回答。
 
 ---
 
@@ -168,10 +168,10 @@ M=skills/noova-generation/scripts/noova_media.py
 # 问答板：类型 → 模型 → 参数（三级，逐级确认）
 python $M form --json
 python $M form --type image --json
-python $M form --code "Demo Image 2.5 flare" --json
+python $M form --code "模型编码示例" --json
 
 # 生成图片（模型编码含空格必须加引号）
-python $M image --prompt "一只戴墨镜的猫" --model "Demo Image 2.5 flare" --param size=1024x1024
+python $M image --prompt "一只戴墨镜的猫" --model "模型编码示例" --param size=1024x1024
 
 # 生成视频：先提交，拿到任务 ID 后再续等（避免长占终端）
 python $M video --prompt "海浪拍打礁石" --no-wait
@@ -193,11 +193,11 @@ python $M credit --json                  # 积分余额
 ### 上传素材
 
 ```bash
-python $M upload --file ./photo.png              # 默认自动选通道
-python $M upload --file ./clip.mp4 --host platform  # 指定平台存储通道（需 Key）
+python $M upload --file ./photo.png              # 上传素材（平台存储通道）
+python $M upload --file ./clip.mp4 --host platform  # 显式指定平台存储通道（需 Key）
 ```
 
-> ⚠️ 默认前两个通道是**第三方免费图床**，不适合敏感或重要数据；可靠存放请用 `--host platform`。
+> 素材只上传到**平台自有存储**（需 API Key），不经手任何第三方服务。
 
 ### 输出与退出码
 

@@ -116,7 +116,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 ## 3. 传参注意事项
 
 1. **参数名大小写敏感，且各模型写法可能不同**：必须以**该模型参数契约**的写法为准。
-   实测同一平台上既有 `aspect_ratio`（如 `demo-video-rt`）也有 `aspectRatio`（如 `demo-image-2-G`）——
+   实测同一平台上既有 `aspect_ratio` 也有 `aspectRatio`——
    所以不要凭"惯例"替换命名，**先查表**，再原样传。
 2. **未列出的参数名不会生效**：平台会忽略模型不认识的键，**不报错**。写错名字的典型表现是
    "请求成功了但效果没变化"。因此传参前先查表。

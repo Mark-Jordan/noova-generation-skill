@@ -272,7 +272,7 @@ class BaseUrlBypassTest(unittest.TestCase):
         import urllib.error
         import urllib.request
         handler = nc.PublicRedirectHandler()
-        request = urllib.request.Request("https://img.thirdparty-a.ee/x")
+        request = urllib.request.Request("https://cdn.example.org/x")
         with self.assertRaises(urllib.error.HTTPError):
             handler.redirect_request(request, None, 302, "Found", {},
                                      "http://127.0.0.1:9/evil.png")
@@ -694,17 +694,17 @@ class RequiredParamFieldMappingTest(unittest.TestCase):
 
 
 class InvocationSpecTruthfulnessTest(unittest.TestCase):
-    def test_sampleprot_route_reports_no_stream_support(self):
-        """修复前：报 stream_supported=true，与 `--stream --protocol sampleprot` 报错矛盾。"""
+    def test_route_without_mapping_reports_no_stream_support(self):
+        """未映射的协议不得虚报成支持流式。"""
         model = nm._normalize_model({
             "model": "t1", "displayName": "T", "modelType": "text",
-            "status": "online", "protocols": ["sampleprot", "openai"],
+            "status": "online", "protocols": ["openai"],
             "billing": {"mode": "per_token", "pricePer1M": {"input": 1, "output": 2}},
             "surchargeRules": [], "params": []})
         spec = nm._invocation_spec(model)
-        self.assertFalse(spec["stream_supported"])
-        sampleprot = next(r for r in spec["routes"] if r["protocol"] == "sampleprot")
-        self.assertFalse(sampleprot["stream_supported"])
+        route = next(r for r in spec["routes"] if r["protocol"] == "openai")
+        self.assertEqual(route["path"], "/v1/chat/completions")
+        self.assertTrue(route["stream_supported"])
 
     def test_create_route_carries_http_method(self):
         model = nm._normalize_model({

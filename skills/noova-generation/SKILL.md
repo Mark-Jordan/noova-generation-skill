@@ -1,11 +1,11 @@
 ---
 name: noova-generation
-description: Use when the user wants to actually generate or call a model on the NooVa AI platform (noova.live / noova.vip) through its public API — 生图 / 画一张图 / 生视频 / 生成音频 / 写文案 / 文本生成 / 调用平台上的模型 — or asks about NooVa-platform-only live facts, such as which models the platform currently offers, a NooVa model's live parameter contract and allowed values, credit cost, balance, task polling, or one-time API key setup. Always confirms model and parameters through an interactive panel BEFORE generating. Do NOT load this skill to answer knowledge questions about a model itself (for example 「demo-image-2 的官方参数」「size 参数有哪些取值」「SampleModel 支持哪些分辨率」), or to explain what some third-party or upstream model supports; answer those from the provider's official docs or general knowledge. Distinguishing test — does the user want to do something on the NooVa platform, or only understand a model?
+description: Use when the user wants to actually generate or call a model on the NooVa AI platform (noova.live / noova.vip) through its public API — 生图 / 画一张图 / 生视频 / 生成音频 / 写文案 / 文本生成 / 调用平台上的模型 — or asks about NooVa-platform-only live facts, such as which models the platform currently offers, a NooVa model's live parameter contract and allowed values, credit cost, balance, task polling, or one-time API key setup. Always confirms model and parameters through an interactive panel BEFORE generating. Do NOT load this skill to answer knowledge questions about a model itself (for example 「某个编码的官方参数」「某参数有哪些取值」「某模型支持哪些分辨率」), or to explain what some third-party or upstream model supports; answer those from the provider's official docs or general knowledge. Distinguishing test — does the user want to do something on the NooVa platform, or only understand a model?
 license: MIT — see the LICENSE file in this repository.
 compatibility: "需要 Python ≥ 3.8（仅标准库，无第三方依赖）；运行时需能访问 https://noova.vip 或 https://noova.live。"
 metadata:
   author: NooVa AI
-  version: "1.9.1"
+  version: "1.9.2"
 ---
 
 # NooVa AI 生成调用（公开 API）
@@ -23,9 +23,9 @@ metadata:
 
 | 用户意图 | 例子 | 冷启动时是否加载本 skill |
 |---|---|---|
-| 要生成 / 要调用平台 | 「生一张图」「用 demo-image-2 帮我生图」 | ✅ 加载 |
+| 要生成 / 要调用平台 | 「生一张图」「用某个模型编码帮我生图」 | ✅ 加载 |
 | 问平台实时事实 | 「你们现在有哪些模型」「这个模型在平台能填哪些值」「我还剩多少积分」 | ✅ 加载（`models` / `params` / `credit`） |
-| 纯模型知识（官方 / 上游规范） | 「demo-image-2 官方参数是什么」「SampleModel 官方支持哪些分辨率」 | ❌ 不加载；据官方文档 / 通用知识回答 |
+| 纯模型知识（官方 / 上游规范） | 「某模型的官方参数是什么」「某模型官方支持哪些分辨率」 | ❌ 不加载；据官方文档 / 通用知识回答 |
 
 **判据**：用户问的是「**这个模型本身（官方 / 上游规范）**」还是「**NooVa 平台 / 这个 API 上的模型**」？
 
@@ -188,7 +188,7 @@ python3 <SKILL_DIR>/scripts/noova_key.py doctor          # 九项自检：Python
 | `chat` | 文本生成（同步，支持流式） | `--prompt`、`--model`、`--system`、`--stream`、`--protocol`、`--image`、`--show-usage` |
 | `task` | 查询一次任务状态（不轮询）；失败原因在响应体 `error` | `--id <任务ID>`、`--type`、`--timeout`、`--json` |
 | `wait` | 把已创建的任务轮询到终态（配合 `--no-wait`） | `--id <任务ID>`、`--type`、`--max-wait` |
-| `upload` | 上传本地文件，得到可被生成接口引用的地址 | `--file <路径>`、`--host auto\|thirdparty-a\|thirdparty-b\|platform` |
+| `upload` | 上传本地文件，得到可被生成接口引用的地址 | `--file <路径>`、`--host auto\|platform` |
 | `credit` | 查询积分余额 | `--json` |
 
 **过程信息（`[提交]` / `[轮询]`）走 stderr，结果与计费反馈走 stdout**；
@@ -219,8 +219,8 @@ python3 <SKILL_DIR>/scripts/noova_key.py doctor          # 九项自检：Python
 - `--model` **必须由用户选定后显式传入**（见「标准工作流 §1」）。省略时脚本会退化为"自动选择该类型下
   第一个上线模型"并把所选模型打印到 stderr——这只允许在用户已明确授权"你来挑"时使用，
   **不得**作为默认路径。
-- **模型编码 / 线路名可能含空格**（生产实测 `Demo Image 2.5 flare`、`Demo Image 2.5 sunburst`、
-  `Demo Vision 2.1` 等）。拼命令时给 `--model` / `--code` 的值**加引号**，
+- **模型编码 / 线路名可能含空格**（如 `Acme Image 2.5 flare`、`Acme Image 2.5 sunburst`、
+  `Acme Vision 2.1` 这类）。拼命令时给 `--model` / `--code` 的值**加引号**，
   否则 shell 会把编码拆成多个参数、脚本按用法错误退出。
 - `--param 名称=值` 可重复，用于传模型参数（名称与取值**必须**来自 `params` 查询结果）。
 - `--ref-image/--ref-video/--ref-audio` 可传 URL，**也可传本地文件路径（脚本会自动上传）**。
@@ -337,21 +337,21 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码> --json
 - 契约里**没有 `description`**：不要向用户声称"某个参数的说明里写了什么"。
 - 报价时把 `billing` 与 `surchargeRules` **一起算**，并用 `credit_per_yuan`（100 积分 = 1 元）换算人民币。
 - `line`（线路）是**运营手填的自由文本**，**只是给用户看的通道名**。
-  **绝不可**用线路文本里的数字计价——生产实测 `demo-video-rt` 的线路写 `-6/个`，真实单价是 500 积分/次（5 元）。
+  **绝不可**用线路文本里的数字计价——线路文本中的数字与真实单价可能不一致。
   计价真值**只有** `billing` 与 `surchargeRules`。
 
 ### 3. 文本生成
 
 ```bash
 python3 <SKILL_DIR>/scripts/noova_media.py chat --prompt "为新品咖啡写一句品牌标语"
-python3 <SKILL_DIR>/scripts/noova_media.py chat --prompt "写一段 200 字介绍" --model demo-text-5.5
+python3 <SKILL_DIR>/scripts/noova_media.py chat --prompt "写一段 200 字介绍" --model <模型编码>
 python3 <SKILL_DIR>/scripts/noova_media.py chat --prompt "继续写" --stream      # 流式
 python3 <SKILL_DIR>/scripts/noova_media.py chat --prompt "看图说想法" --image ./photo.png   # 多模态输入
 ```
 
 `chat` 默认按模型主协议走**原生路由**（OpenAI → `/v1/chat/completions`，Anthropic → `/v1/messages`）。
 用户明确说"用 Anthropic/OpenAI 格式调用"时，加 `--protocol anthropic|openai` 让路由与报文格式显式对齐。
-`--protocol` 可选 `auto|openai|anthropic|sampleprot|responses`；模型不支持所请求的协议时**发请求前**即报错并列出可用协议。
+`--protocol` 可选 `auto|openai|anthropic|responses`；模型不支持所请求的协议时**发请求前**即报错并列出可用协议。
 
 文本生成同样**先弹问答板再生成**：`form --type text --json` 让用户选模型 → `form --code <该编码> --json` 看参数面板。
 文本模型的面板里 `extra_cli_options` 会列出 `--system` / `--stream` / `--max-tokens` / `--temperature`，
@@ -395,10 +395,8 @@ python3 <SKILL_DIR>/scripts/noova_media.py video --prompt "..." --no-wait
   - 失败：`failed` / `failure` / `error` / `canceled` / `cancelled` / `expired`
   - `task --id` 遇到失败态会打印失败原因并返回**退出码 1**，**不会**再说「仍在处理中」。
 - **文本模型走协议原生路由**：OpenAI → `POST /v1/chat/completions`；Anthropic → `POST /v1/messages`
-  （`max_tokens` 必填）。`chat --protocol auto|openai|anthropic|sampleprot|responses` 可显式指定，
-  模型不支持时**发请求前**即报错。**平台当前不对外提供 SampleProt 协议**（实测 0 个模型声明；
-  `sampleprot-*` 命名模型走 `openai`/`anthropic`），该分支仅为契约驱动的前向兼容，正常不会触发；
-  本 skill 不做 sampleprot 流式。
+  （`max_tokens` 必填）。`chat --protocol auto|openai|anthropic|responses` 可显式指定，
+  模型不支持时**发请求前**即报错。
 - **图像/视频/音频走统一入口**：`POST /api/v1/invoke`；创建后用 `POST /v1/content` 查询/轮询。
 - 默认等待上限按类型给足（图像 600s / 音频 1200s / 视频 5400s），可用 `--max-wait` 覆盖；
   `--timeout` 对**创建、轮询、单次查询**都生效。
@@ -452,18 +450,10 @@ python3 <SKILL_DIR>/scripts/noova_media.py video --prompt "..." --no-wait
 
 ```bash
 python3 <SKILL_DIR>/scripts/noova_media.py upload --file ./photo.png          # 默认自动选通道
-python3 <SKILL_DIR>/scripts/noova_media.py upload --file ./clip.mp4 --host platform   # 指定通道
+python3 <SKILL_DIR>/scripts/noova_media.py upload --file ./clip.mp4 --host platform
 ```
 
-默认按 **第三方图床一 → 第三方图床二 → 平台存储通道** 顺序尝试，任一成功即返回（脚本会做可达性校验）。
-平台存储通道需要 API Key，未配置时自动跳过。
-
-> ⚠️ **前两个是第三方免费图床，不是平台自有服务**：文件存储与访问由第三方提供，可能出现文件被清理、
-> 链接失效、内容不校验等问题。**禁止上传敏感或重要数据**；如需可靠存放，用 `--host platform`（需 Key）。
-> 逐通道失败原因会打印出来，便于判断是限流还是格式问题。
->
-> 其中**第三方图床一依赖浏览器指纹头**（对方站点对程序化直调做了同源校验），属对方随时可能收紧的
-> 非稳定通道；默认顺序是它的历史行为，实际选用请以 `--host` 显式指定为准。
+素材只上传到**平台自有存储**（需 API Key），不经手任何第三方服务；脚本会做可达性校验。
 
 细节见 `references/api-contracts.md` 的「素材上传」一节。
 
@@ -486,7 +476,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py upload --file ./clip.mp4 --host platf
 | 文件 | 内容 |
 |---|---|
 | `references/api-contracts.md` | 公开端点、鉴权方式、请求/响应结构、错误码、限流 |
-| `references/protocols.md` | 同步/任务型/流式三种调用模式 + OpenAI/Anthropic/SampleProt 协议适配与报文样例 |
+| `references/protocols.md` | 同步/任务型/流式三种调用模式 + 各协议适配与报文样例 |
 | `references/parameters.md` | 参数查询方法与参数语义（如何回答"这个参数是什么/能填什么"） |
 | `references/troubleshooting.md` | 常见错误现象 → 原因 → 处理方式 |
 | `references/host-compatibility.md` | 不同 agent / 操作系统的运行时、权限、网络边界，以及**装到哪**（分发目标） |
@@ -498,7 +488,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py upload --file ./clip.mp4 --host platf
 |---|---|
 | `scripts/noova_key.py` | 配置与引导：`status` / `guide` / `setup` / `save` / `verify` / `doctor` / `base` / `clear` |
 | `scripts/noova_media.py` | 交互问答板（`form`）、模型发现、参数查询、生成、轮询、上传、余额（CLI 主入口） |
-| `scripts/noova_upload.py` | 素材上传：第三方图床一/二 + 平台存储通道（自动降级、可达性校验） |
+| `scripts/noova_upload.py` | 素材上传：平台存储通道（可达性校验） |
 | `scripts/noova_common.py` | 共享基础设施：**地址守卫**、**脱敏**、终端排版（其余三个脚本都引用它） |
 
 本 skill 只含标准结构（`SKILL.md` + `scripts/` + `references/`）；不含任何安装/分发逻辑——

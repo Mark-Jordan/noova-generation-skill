@@ -34,7 +34,7 @@
 |---|---|---|
 | 推荐 | `Authorization: Bearer <API_KEY>` | 所有需要鉴权的端点（模型参数 / 生成 / 查询 / 上传 / 余额） |
 | 兼容 | `X-API-Key: <API_KEY>` | 同上 |
-| 兼容 | `x-sample-api-key: <API_KEY>` | 供 SampleProt 官方 SDK 使用 |
+| 兼容 | `x-api-key: <API_KEY>` | Anthropic 协议的常见写法 |
 
 - API Key 形如 `sk-...`，在官网 `https://noova.vip/api_control`（备用域名 `https://noova.live/api_control`）创建：登录 → 「API 管理」→ 点「创建 API Key」
   → 填密钥名称 → 「确认创建」→ **立即复制完整 Key**（只在创建时展示一次，之后仅显示摘要）。
@@ -68,7 +68,7 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `model` | string | **对外模型编码**（请求时原样使用；空串 = 平台未给编码，**不可调用**） |
-| `displayName` | string | 展示名。**同名模型真实存在**（生产实测 `Demo Image 2.5` ×3、`Demo Video 2.5` ×4） |
+| `displayName` | string | 展示名。**同名模型真实存在**（同一展示名可能对应多条线路，编码不同） |
 | `line` | string | **线路**：同一模型的接入通道名。空串 = 运营未填，展示为「默认」 |
 | `modelType` | string | `text` / `image` / `video` / `audio` |
 | `status` | string | `online`（在线，可调用）/ `maintenance`（维护中，暂不可调用）。**对外只呈现这两类**：`test` / `deprecated` 等状态在取数入口（`_fetch_public_model_specs`）即被过滤，不会进入任何输出；展示时必须注明是「在线」还是「维护中」 |
@@ -137,8 +137,8 @@
 
 **路由怎么选（先看这一句）**：
 
-- **文本模型** → 走该模型**主协议的原生官方路由**：[OI] → `POST /v1/chat/completions`，
-  Anthropic → `POST /v1/messages`，SampleProt → `POST /v1beta/models/<model>:generateContent`（见 §3.2）。
+- **文本模型** → 走该模型**主协议的原生官方路由**：OpenAI 兼容 → `POST /v1/chat/completions`，
+  Anthropic → `POST /v1/messages`（见 §3.2）。
 - **图像 / 视频 / 音频（任务型）** → 走 `POST /api/v1/invoke`（见 §3.1）。
   平台对这三类模型公开的契约**只声明这一条创建路由**，没有协议原生替代路径。
 - 两类都用 §4 的 `POST /v1/content` 查结果（任务型）。
@@ -196,20 +196,15 @@
 |---|---|---|---|---|
 | `POST /v1/chat/completions` | [OI] | `{model, messages[], stream?}` | `Authorization: Bearer` | `choices[0].message.content` |
 | `POST /v1/messages` | Anthropic | `{model, max_tokens, messages[], system?, stream?}`（`max_tokens` **必填**） | `Authorization: Bearer`（亦兼容 `x-api-key`） | `content[].text` |
-| `POST /v1beta/models/<model>:generateContent` | SampleProt（**平台当前未提供**） | `{contents:[{parts:[{text}]}]}` | `Authorization: Bearer` / `x-sample-api-key` | `candidates[].content.parts[].text` |
-| `POST /v1/responses` | [OI] Responses | `{model, input, instructions?, max_output_tokens?}` | `Authorization: Bearer` | `output[].content[].text` |
+| `POST /v1/responses` | Responses | `{model, input, instructions?, max_output_tokens?}` | `Authorization: Bearer` | `output[].content[].text` |
 
 - 用原生路由时，**请求与响应都是该协议的原样格式**（不做跨协议转换）——必须按该协议官方字段构造报文，
   否则会得到上游的参数错误。
-- 文本模型默认用**主协议**路由；`chat --protocol openai|anthropic|sampleprot|responses` 可显式指定。
-- **`/v1/responses` 的现状**：该路由在网关上**确实存在**（实测 2026-09-29：`POST` → `400 请求体缺少 model`，
+- 文本模型默认用**主协议**路由；`chat --protocol openai|anthropic|responses` 可显式指定。
+- **`/v1/responses` 的现状**：该路由在网关上**确实存在**（实测：`POST` → `400 请求体缺少 model`，
   而非 `404`），脚本也已支持按该协议构造报文与解析响应；但**当前模型契约均未把它声明为支持协议**，
   因此 `--protocol responses` 对现有模型会明确报"不支持"而不是静默失败。
   将来某模型声明了它，脚本无需改动即可直接使用。
-- **`sampleprot` 协议的现状**：后端注册了 `/v1beta/models/<model>:generateContent`，但**当前全平台没有任何模型
-  把它声明为支持协议**（实测 2026-10-09：34 个模型 0 个含 `sampleprot`；`sample-3.7-flash` / `sample-3.8-flash`
-  等 SampleProt 系模型的协议是 `openai` / `anthropic`）。故 `--protocol sampleprot` 对现有模型一律报“不支持”；
-  本 skill **不做 sampleprot 流式**（不实现 `:streamGenerateContent`）。
 - 模型不支持所请求的协议时，脚本在发请求**之前**就报错并列出可用协议（不会发出必然失败的请求）。
 - **图像 / 视频 / 音频不使用本节路由**（其公开契约未声明这些路径），一律走 §3.1。
 
@@ -291,26 +286,17 @@
 
 ### 素材上传（本地文件 → 可被生成接口引用的 URL）
 
-把本地图片/视频（作为参考图、首帧、参考视频/音频）变成公网地址。三个通道**按顺序尝试，任一成功即返回**：
+把本地图片/视频（作为参考图、首帧、参考视频/音频）变成公网地址。
 
-| 顺序 | 通道 | 地址 | 特点与限制 |
-|---|---|---|---|
-| 1 | 第三方图床一 | `POST https://img.thirdparty-a.ee/api/upload` | 图片（JPG/PNG/GIF/WebP/BMP）与视频（**≤20MB**）；**必须携带浏览器指纹头**（`User-Agent` / `Origin` / `Referer`），缺失直接 403「不允许直接调用API」 |
-| 2 | 第三方图床二 | `POST https://thirdparty-b.thirdparty-b-example.chat/api/upload` | 无需额外请求头；**不校验文件真实内容**（纯文本改后缀也可能被接受） |
-| 3 | 平台存储通道 | `GET /v1/client/resource/sts` 签发后直传（需 API Key） | 产物落在**平台自有存储**，最可靠；未配置 Key 时自动跳过 |
+| 通道 | 地址 | 特点与限制 |
+|---|---|---|
+| 平台存储通道 | `GET /v1/client/resource/sts` 签发后直传（需 API Key） | 产物落在**平台自有存储**：最可靠，素材不经手任何第三方服务 |
 
-- 两者都是 `multipart/form-data`，文件字段名均为 `file`。
-- **图床一响应**：`{success, url, directUrl, previewUrl}` —— 三个地址都是**相对路径**，
-  需拼 `https://img.thirdparty-a.ee` 才是可访问地址；脚本优先取 `directUrl`（直链）并自动补全域名。
-- **图床二响应**：`{url, created}` —— `url` 已是绝对地址可直接引用。
-- 图床一/图床二是**第三方免费图床，非平台自有服务**：文件存储与访问由第三方提供，
-  可能存在文件被清理、链接失效、内容不校验等风险。**禁止上传敏感或重要数据**；
-  因使用第三方图床产生的数据丢失或安全风险，平台不承担责任。因此本 skill 默认在前两者失败后
-  自动降级到平台存储通道（需 Key），并逐通道打印失败原因。
-- CLI：`upload --file <路径> [--host auto|thirdparty-a|thirdparty-b|platform]`（`auto` = 上表顺序）。
+- 上传为 `multipart/form-data` / 直传（以签发凭证返回的 `upload.method` 为准）。
+- CLI：`upload --file <路径> [--host auto|platform]`（`auto` = 平台存储通道）。
   上传完成后脚本会做一次可达性校验（`verified` 字段）。
-- **三个通道都会把文件名转成 ASCII 安全名**（非 ASCII 段折叠为 `_`，空则回退 `file`）——
-  中文文件名在部分图床/存储的编码与签名实现里会产生歧义。
+- **文件名会转成 ASCII 安全名**（非 ASCII 段折叠为 `_`，空则回退 `file`）——
+  中文文件名在部分存储的编码与签名实现里会产生歧义。
 - **可达性校验的判定**：`2xx/3xx` 视为通过；`405`/`416`（对方不支持这种校验请求）视为
   **无法判定**；`403` **如实报为"不可公开访问"**——403 恰恰证明上游取不到这个地址，
   不能当作通过。校验请求**不会**发往本机/内网地址（不做本机探测）。

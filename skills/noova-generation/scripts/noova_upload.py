@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
-"""素材上传封装：第三方图床（thirdparty-a / thirdparty-b）+ 平台自有存储兜底。
+"""素材上传封装：平台自有存储通道（需 API Key）。
 
 用途
 ----
 把本地图片/视频/音频上传成**公网可访问的 URL**，供生成接口的
 `referenceImages` / `referenceVideos` / `referenceAudios` 等字段引用。
 
-通道优先级（`host="auto"`，默认）
---------------------------------
-1. `thirdparty-a`      —— 第三方图床（需浏览器指纹头），返回相对路径需补齐站点域名
-2. `thirdparty-b` —— 第三方图床（无需额外头），返回绝对 URL
-3. `platform`   —— 平台自有的上传凭证通道，直传平台自有存储（**需要 API Key**）
-
-前两个通道是**第三方免费图床**，非平台自有服务：文件存储与访问由第三方提供，
-可能存在文件被清理、链接失效、不校验真实文件内容等风险。请勿上传敏感或重要数据。
-因此本模块**按顺序尝试、失败自动降级**，并在最终失败时汇总每个通道的原因。
-
 设计约束
 --------
 - 只用 Python 标准库（与 skill 其余脚本一致，零安装依赖）。
 - 不打印 API Key、不打印鉴权头。
-- 通道名与 URL 都来自平台公开的「素材上传」接口文档，属公开信息。
+- 上传产物只进**平台自有存储**：素材不经手任何第三方服务，避免链接失效、
+  内容不校验与数据外泄风险。
 
 被 `noova_media.py` 引用（`upload` 子命令、参考文件自动上传）。
 """
@@ -55,35 +46,14 @@ KEY_SCRIPT = (SCRIPT_DIR / "noova_key.py").as_posix()
 KEY_CMD = python_cmd(KEY_SCRIPT)
 
 # ---------------------------------------------------------------------------
-# 通道定义（全部来自平台公开接口文档）
+# 通道定义
 # ---------------------------------------------------------------------------
 
-THIRDPARTY_A_BASE = "https://img.thirdparty-a.ee"
-THIRDPARTY_A_UPLOAD_URL = f"{THIRDPARTY_A_BASE}/api/upload"
-# thirdparty-a 站点做了同源校验：缺少浏览器指纹头会直接 403「不允许直接调用API」。
-THIRDPARTY_A_BROWSER_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
-    "Origin": THIRDPARTY_A_BASE,
-    "Referer": f"{THIRDPARTY_A_BASE}/",
-}
-
-THIRDPARTY_B_BASE = "https://thirdparty-b.thirdparty-b-example.chat"
-THIRDPARTY_B_UPLOAD_URL = f"{THIRDPARTY_B_BASE}/api/upload"
-
-# thirdparty-a 文档声明：视频 ≤ 20MB。超过时仍会尝试（图片可能不受此限），仅打印提示。
-THIRDPARTY_A_DOC_SIZE_LIMIT = 20 * 1024 * 1024
-
-# 本工具自己的硬上限：超过这个体积的素材几乎必然被图床拒绝，而上传过程会长时间
-# 占用带宽与内存。提前拒绝比传到一半失败更有用（用户能立刻知道要压缩）。
+# 上传硬上限：超过这个体积的素材几乎必然被拒绝，而上传过程会长时间占用带宽与内存。
+# 提前拒绝比传到一半失败更有用（用户能立刻知道要压缩）。
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
-# 客户端标识（见上：统一由 noova_key 提供，避免多处硬编码漂移）
-
-# 这些主机是平台公开接口文档里点名的第三方图床，属公开信息，不做脱敏替换。
-PUBLIC_UPLOAD_HOSTS = ("img.thirdparty-a.ee", "thirdparty-b.thirdparty-b-example.chat")
-
-ALL_HOSTS = ("thirdparty-a", "thirdparty-b", "platform")
+ALL_HOSTS = ("platform",)
 DEFAULT_HOST_ORDER = ALL_HOSTS
 
 # 常见素材的 MIME 推断（图床据此做类型判断，尽量给准）
@@ -101,8 +71,6 @@ def guess_content_type(name: str) -> str:
     return MEDIA_CONTENT_TYPES.get(Path(str(name or "")).suffix.lower(), "application/octet-stream")
 
 HOST_LABELS = {
-    "thirdparty-a": "第三方图床一",
-    "thirdparty-b": "第三方图床二",
     "platform": "平台存储通道",
 }
 
@@ -248,42 +216,23 @@ def absolutize(base: str, value: str) -> str:
     return f"{base.rstrip('/')}/{text.lstrip('/')}"
 
 
-def parse_thirdparty-a_response(payload: object) -> str:
-    """从 thirdparty-a 响应中取回可引用的绝对直链；失败抛 UploadError。
+def parse_platform_response(payload: object) -> str:
+    """从平台上传响应中取回可引用的绝对 URL；失败抛 UploadError。
 
-    成功响应形如：
-        {"success": true, "url": "/api/file/xxx.png",
-         "directUrl": "/api/file/xxx.png", "previewUrl": "/view/yyy"}
-    优先 `directUrl`（直链），退回 `url`；`previewUrl`/`shortUrl` 是预览页，不作为素材地址。
+    成功响应形如：`{"file_url": "https://.../a.png"}`（具体字段名以契约为准，
+    本函数只是兼容性兜底；主路径由 `noova_media` 的平台上传实现负责）。
     """
     if not isinstance(payload, dict):
-        raise UploadError("图床返回了无法解析的内容")
-    if payload.get("success") is False:
-        reason = str(payload.get("message") or payload.get("msg") or payload.get("error") or "").strip()
-        raise UploadError(f"图床拒绝上传{f'：{reason}' if reason else ''}")
-    for field_name in ("directUrl", "url", "data"):
+        raise UploadError("上传响应无法解析")
+    for field_name in ("file_url", "url", "data"):
         value = payload.get(field_name)
         if isinstance(value, dict):
-            value = value.get("url") or value.get("directUrl")
-        url = absolutize(THIRDPARTY_A_BASE, str(value or ""))
+            value = value.get("file_url") or value.get("url")
+        url = absolutize("", str(value or ""))
         if url:
             return url
-    raise UploadError("图床响应中未包含文件地址")
-
-
-def parse_thirdparty-b_response(payload: object) -> str:
-    """从 thirdparty-b 响应中取回绝对 URL；失败抛 UploadError。
-
-    成功响应形如：{"url": "https://thirdparty-b.thirdparty-b-example.chat/api/proxy/image/xxx.png",
-                   "created": 1786436842981}
-    """
-    if not isinstance(payload, dict):
-        raise UploadError("图床返回了无法解析的内容")
-    url = absolutize(THIRDPARTY_B_BASE, str(payload.get("url") or ""))
-    if url:
-        return url
     reason = str(payload.get("message") or payload.get("error") or "").strip()
-    raise UploadError(f"图床响应中未包含文件地址{f'：{reason}' if reason else ''}")
+    raise UploadError(f"上传响应中未包含文件地址{f'：{reason}' if reason else ''}")
 
 
 def _decode(raw: bytes) -> object:
@@ -307,30 +256,12 @@ def _brief(raw: bytes, limit: int = 160) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 三个通道
+# 上传通道
 # ---------------------------------------------------------------------------
-
-def upload_via_thirdparty-a(path: Path, *, content_type: str, timeout: int = 120) -> str:
-    """通道一：thirdparty-a 图床（携带浏览器指纹头，否则 403）。"""
-    status, raw = _post_file(THIRDPARTY_A_UPLOAD_URL, path=path, content_type=content_type,
-                             headers=THIRDPARTY_A_BROWSER_HEADERS, timeout=timeout)
-    if status >= 400:
-        raise UploadError(f"HTTP {status}{f'：{_brief(raw)}' if raw else ''}")
-    return parse_thirdparty-a_response(_decode(raw))
-
-
-def upload_via_thirdparty-b(path: Path, *, content_type: str, timeout: int = 120) -> str:
-    """通道二：thirdparty-b 图床（无需额外请求头）。"""
-    status, raw = _post_file(THIRDPARTY_B_UPLOAD_URL, path=path, content_type=content_type,
-                             headers={"User-Agent": CLIENT_USER_AGENT}, timeout=timeout)
-    if status >= 400:
-        raise UploadError(f"HTTP {status}{f'：{_brief(raw)}' if raw else ''}")
-    return parse_thirdparty-b_response(_decode(raw))
-
 
 def upload_via_platform(path: Path, *, content_type: str, timeout: int = 180,
                         platform_uploader: Callable[[Path, str, int], str] | None = None) -> str:
-    """通道三：平台自有上传（签发凭证 → 直传平台自有存储），需要 API Key。
+    """平台自有上传（签发凭证 → 直传平台自有存储），需要 API Key。
 
     `platform_uploader` 由 `noova_media.py` 注入（复用其鉴权、错误映射与脱敏逻辑）。
     """
@@ -347,13 +278,12 @@ def upload_file(path: Path, *, api_key: str | None = None, content_type: str | N
                 host: str = "auto", timeout: int = 180,
                 platform_uploader: Callable[[Path, str, int], str] | None = None,
                 log: Callable[[str], None] | None = None) -> dict:
-    """把本地文件上传为公网 URL；按 `host` 决定通道。
+    """把本地文件上传为公网 URL。
 
-    - `host="auto"`（默认）：依次尝试 thirdparty-a → thirdparty-b → platform，任一成功即返回。
-      platform 通道仅在提供了 API Key 时参与，否则跳过（不影响前两个通道）。
-    - `host=<通道名>`：只用该通道（便于定位问题，不做降级）。
+    - `host="auto"`（默认）：使用平台存储通道上传。
+    - `host="platform"`：同上（显式指定）。
 
-    返回 `{"url", "provider", "bytes", "content_type"}`；全部失败抛 `UploadError`
+    返回 `{"url", "provider", "bytes", "content_type"}`；失败抛 `UploadError`
     （其 `attempts` 逐条记录每个通道的结果）。
     """
     target = Path(path).expanduser()
@@ -368,7 +298,7 @@ def upload_file(path: Path, *, api_key: str | None = None, content_type: str | N
     if host != "auto":
         if host not in ALL_HOSTS:
             raise UploadError(f"未知的上传通道：{host}",
-                              hint="可用通道：" + "、".join(ALL_HOSTS) + "（auto = 依次尝试）")
+                              hint="可用通道：" + "、".join(ALL_HOSTS) + "（auto = 同上）")
         order: tuple[str, ...] = (host,)
     else:
         order = DEFAULT_HOST_ORDER
@@ -383,16 +313,9 @@ def upload_file(path: Path, *, api_key: str | None = None, content_type: str | N
             continue
         if show_progress:
             tell(f"[上传 {index}/{len(order)}] 使用{HOST_LABELS.get(name, name)}…")
-        if name == "thirdparty-a" and size > THIRDPARTY_A_DOC_SIZE_LIMIT:
-            tell(f"[提示] 文件 {size // 1024 // 1024}MB 超过第三方图床一文档声明的 20MB 上限，仍会尝试")
         try:
-            if name == "thirdparty-a":
-                url = upload_via_thirdparty-a(target, content_type=resolved_type, timeout=timeout)
-            elif name == "thirdparty-b":
-                url = upload_via_thirdparty-b(target, content_type=resolved_type, timeout=timeout)
-            else:
-                url = upload_via_platform(target, content_type=resolved_type, timeout=timeout,
-                                          platform_uploader=platform_uploader)
+            url = upload_via_platform(target, content_type=resolved_type, timeout=timeout,
+                                      platform_uploader=platform_uploader)
         except UploadError as exc:
             attempts.append({"host": name, "ok": False, "detail": exc.message})
             tell(f"[上传失败] {HOST_LABELS.get(name, name)}：{exc.message}")
@@ -407,17 +330,12 @@ def upload_file(path: Path, *, api_key: str | None = None, content_type: str | N
         return {"url": url, "provider": name, "bytes": size, "content_type": resolved_type}
 
     if host == "auto":
-        if not api_key and any(a["host"] == "platform" for a in attempts):
-            hint = (f"第三方图床均不可用。平台存储通道需要 API Key："
-                    f"先执行 {KEY_CMD} setup --stdin 后重试")
-        else:
-            hint = "第三方图床为免费服务，可能临时不可用；可稍后重试或更换文件后重试"
-    elif host == "platform":
         hint = (f"平台存储通道需要有效 API Key："
                 f"先执行 {KEY_CMD} setup --stdin 后重试")
     else:
-        hint = "该图床为第三方免费服务，可能限流或临时故障；可改用 --host auto 自动降级到其它通道"
-    raise UploadError("所有上传通道均失败", attempts=attempts, hint=hint)
+        hint = (f"平台存储通道需要有效 API Key："
+                f"先执行 {KEY_CMD} setup --stdin 后重试")
+    raise UploadError("上传失败", attempts=attempts, hint=hint)
 
 
 def verify_url(url: str, *, timeout: int = 30) -> tuple[bool, str]:
