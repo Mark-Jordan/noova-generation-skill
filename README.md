@@ -34,9 +34,7 @@ Agent：[类型面板] 图像 / 视频 / 音频 / 文本  → 用户选「图像
   - [方式三：手动安装](#方式三手动安装)
 - [API Key 配置](#api-key-配置)
 - [使用示例](#使用示例)
-- [设计原则](#设计原则)
 - [仓库结构](#仓库结构)
-- [开发与测试](#开发与测试)
 - [常见问题](#常见问题)
 - [License](#license)
 
@@ -209,22 +207,6 @@ python $M upload --file ./clip.mp4 --host platform  # 指定平台存储通道�
 
 ---
 
-## 设计原则
-
-这个 skill 从三轮安全审计演化而来，几条不变量是**硬约束**而非风格偏好：
-
-| 原则 | 含义 |
-|---|---|
-| **用户确认才生成** | 模型与参数必须由用户逐级确认，绝不代用户选完就扣费 |
-| **一切运行时取真值** | 模型清单、参数契约、计价规则全部实时拉取，**绝不硬编码** |
-| **失败关闭（fail-closed）** | 没有 Key 不发请求；地址非法不发请求；校验失败不写盘 |
-| **输出零内部信息** | 不吐服务商、内部域名、存储桶、堆栈；错误信息二次脱敏（含 `--json` 路径） |
-| **超时 ≠ 失败** | 等待超时只提示续查任务 ID，绝不当成「生成失败」 |
-| **报价必引运行时数据** | 单价只来自 `params` 的 `billing` / `surchargeRules`；扣减口径为余额差值 |
-| **零第三方依赖** | 纯 Python 标准库，兼容 3.8+，下载即可跑 |
-
----
-
 ## 仓库结构
 
 ```
@@ -247,32 +229,6 @@ noova-generation-skill/
 │           └── noova_common.py   # 地址守卫 + 脱敏 + 排版（共享基础设施）
 └── tests/                        # 单元测试（离线、不消耗积分）
 ```
-
----
-
-## 开发与测试
-
-```bash
-python install.py validate                # skill 目录形态校验
-python -m pytest tests -q                 # 444+ 用例，离线，不消耗积分
-python -m unittest discover -s tests -t tests -p "test_noova_*.py"   # 纯标准库跑法
-```
-
-测试全部**离线**（在死代理下也应全绿）且**不写用户真实配置**（默认指向临时目录）。
-
-**版本号不变量**（`tests/test_noova_install.py` 机械校验，三处必须一致）：
-
-1. `skills/noova-generation/SKILL.md` 的 `metadata.version`
-2. `skills/noova-generation/scripts/noova_key.py` 的 `VERSION`
-3. `skills/noova-generation/references/changelog.md` 中出现同一版本号
-
-### 发布新版本
-
-1. 修改代码与文档；
-2. 同步三处版本号（见上）；
-3. `changelog.md` 记录变更；
-4. `python -m pytest tests -q` 全绿；
-5. `git commit && git tag vX.Y.Z && git push --tags`。
 
 ---
 
