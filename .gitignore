@@ -1,0 +1,36 @@
+# 忽略规则（分发物、缓存、本地配置一律不进版本库）
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 测试与类型检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# skill 的本地凭据与安装清单（绝不入库）
+**/.noova/
+**/.install-manifest.json
+
+# 编辑器与操作系统
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 打包产物
+*.zip
+!skills/**/*.zip

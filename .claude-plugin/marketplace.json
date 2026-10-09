@@ -1,0 +1,22 @@
+{
+  "name": "noova-generation",
+  "owner": {
+    "name": "NooVa AI",
+    "url": "https://noova.vip"
+  },
+  "metadata": {
+    "description": "Agent Skill: call the NooVa AI platform public API to generate images, video, audio and text.",
+    "version": "1.9.0"
+  },
+  "plugins": [
+    {
+      "name": "noova-generation",
+      "description": "让 agent 直接调用 NooVa AI 平台公开 API：生图 / 生视频 / 生音频 / 文本生成，含模型发现、参数契约、积分与计价",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/noova-generation"
+      ]
+    }
+  ]
+}

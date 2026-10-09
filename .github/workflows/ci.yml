@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 单元测试（Python ${{ matrix.python-version }} / ${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 是 skill 声明的最低版本，必须实机验证；
+        # 3.9 / 3.10 覆盖 `socket.timeout` 与 `TimeoutError` 合并前后的差异；
+        # 3.12 是当前主流。
+        python-version: ["3.8", "3.9", "3.10", "3.12"]
+        os: [ubuntu-latest, windows-latest]
+        exclude:
+          # Windows 上只跑一个版本：junction / 路径相关行为与解释器版本无关，
+          # 而 Windows runner 的计费倍率更高。
+          - os: windows-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.10"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: skill 目录形态校验
+        run: python install.py validate
+
+      - name: 单元测试（unittest）
+        run: >
+          python -m unittest discover
+          -s tests -t tests
+          -p "test_noova_*.py" -v
+
+      - name: 单元测试（pytest，验证可被 pytest 收集）
+        run: python -m pytest tests -q
+
+      - name: 确认测试真的离线（在死代理下复跑）
+        shell: bash
+        run: |
+          export HTTP_PROXY=http://127.0.0.1:9
+          export HTTPS_PROXY=http://127.0.0.1:9
+          python -m pytest tests -q
+
+      - name: 确认测试没有污染用户配置目录
+        shell: bash
+        run: |
+          if [ -f "$HOME/.noova/config.json" ]; then
+            echo "::error::测试写入了用户真实配置 $HOME/.noova/config.json"
+            exit 1
+          fi
+          echo "用户配置目录未被测试触碰 ✅"
+
+      - name: 安装器端到端（安装 → 校验 → 卸载）
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="$RUNNER_TEMP/skills"
+          mkdir -p "$TARGET"
+          python install.py install --target "$TARGET"
+          python install.py check --target "$TARGET" --json
+          python install.py uninstall --target "$TARGET" --yes
+          test ! -e "$TARGET/noova-generation"
+
+      - name: 安装器 --link 端到端（链接安装 → 卸载，且不得动源目录）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "skills-link"
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          python install.py install --target $target --link
+          python install.py uninstall --target $target --yes
+          if (Test-Path (Join-Path $target "noova-generation")) { throw "链接未卸载" }
+          if (-not (Test-Path "skills/noova-generation/SKILL.md")) { throw "源目录被破坏" }
+
+  no-secrets:
+    name: 仓库内不得出现明文凭据
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 扫描受版本控制的文件
+        shell: bash
+        run: |
+          set -uo pipefail
+          # 只扫 git 跟踪的文件；命中的一律视为阻断项。
+          patterns='sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          hits=$(git ls-files -z \
+            | xargs -0 -r grep -nEI "$patterns" 2>/dev/null \
+            | grep -v 'sk-REDACTED-ROTATE-THIS-KEY' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::发现疑似明文凭据："
+            echo "$hits"
+            exit 1
+          fi
+          echo "未发现明文凭据 ✅"
+
+  skill-shape:
+    name: skill 目录只含标准结构
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查顶层条目
+        shell: bash
+        run: |
+          set -euo pipefail
+          allowed="SKILL.md scripts references assets"
+          for entry in skills/noova-generation/*; do
+            name=$(basename "$entry")
+            if ! echo "$allowed" | grep -qw "$name"; then
+              echo "::error::skill 目录出现非标准顶层条目：$name"
+              exit 1
+            fi
+          done
+          echo "skill 目录形态标准 ✅"
+
+  version-sync:
+    name: 版本号多处一致
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 比对 SKILL.md / noova_key.py / changelog / package.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          skill_version=$(sed -n 's/^[[:space:]]*version:[[:space:]]*"\([^"]*\)".*/\1/p' skills/noova-generation/SKILL.md | head -1)
+          key_version=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' skills/noova-generation/scripts/noova_key.py)
+          pkg_version=$(python -c "import json;print(json.load(open('package.json'))['version'])")
+          echo "SKILL.md=$skill_version  noova_key.py=$key_version  package.json=$pkg_version"
+          if [ -z "$skill_version" ] || [ "$skill_version" != "$key_version" ]; then
+            echo "::error::SKILL.md 与 noova_key.py 版本号不一致"
+            exit 1
+          fi
+          if [ "$skill_version" != "$pkg_version" ]; then
+            echo "::error::package.json 版本号与 skill 不一致（需同步更新）"
+            exit 1
+          fi
+          grep -q "$skill_version" skills/noova-generation/references/changelog.md \
+            || { echo "::error::references/changelog.md 未记录 $skill_version"; exit 1; }
+          grep -q "$skill_version" CHANGELOG.md \
+            || { echo "::error::根 CHANGELOG.md 未记录 $skill_version"; exit 1; }
+          echo "版本号一致 ✅"

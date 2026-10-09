@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔐 报告安全漏洞（私密）
+    url: https://github.com/Mark-Jordan/noova-generation-skill/security/advisories/new
+    about: 请勿用公开 Issue 报告安全漏洞
+  - name: 📖 使用文档
+    url: https://github.com/Mark-Jordan/noova-generation-skill#readme
+    about: 安装、配置与常见问题先看 README
+  - name: 🧰 排查指南
+    url: https://github.com/Mark-Jordan/noova-generation-skill/blob/main/skills/noova-generation/references/troubleshooting.md
+    about: 常见错误现象 → 原因 → 处理方式

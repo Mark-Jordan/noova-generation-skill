@@ -1,0 +1,60 @@
+name: Bug 报告
+description: 报告使用本 skill 时遇到的可复现问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **不要粘贴真实 API Key。** 需要展示凭据时用占位符 `sk-xxxx`。
+        安全漏洞请走 [私密报告](https://github.com/Mark-Jordan/noova-generation-skill/security/advisories/new)，不要开公开 Issue。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 发生了什么？你期望发生什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 完整命令（把 Key 换成 `sk-xxxx`）与**脱敏后**的输出。
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: skill-version
+    attributes:
+      label: skill 版本
+      description: 见 `skills/noova-generation/SKILL.md` 的 `metadata.version`
+      placeholder: "1.9.0"
+    validations:
+      required: true
+
+  - type: input
+    id: agent
+    attributes:
+      label: Agent 客户端与版本
+      placeholder: "Claude Code 1.x / Codex / Cursor / pi …"
+    validations:
+      required: true
+
+  - type: input
+    id: os-python
+    attributes:
+      label: 操作系统与 Python 版本
+      placeholder: "Windows 11 / Python 3.12.4（或 macOS 15 / python3 3.11）"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor 输出
+      description: 运行 `python skills/noova-generation/scripts/noova_key.py doctor` 并粘贴结果（已自动脱敏）。
+      render: shell
+    validations:
+      required: false

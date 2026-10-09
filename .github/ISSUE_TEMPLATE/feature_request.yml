@@ -1,0 +1,43 @@
+name: 功能请求
+description: 建议新增能力或改进现有行为
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先描述**用户场景**，再描述你设想的实现方式。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 用户场景
+      description: 用户想做什么？现在会遇到什么阻碍？
+      placeholder: "用户想批量生成 10 张图并先看报价再确认，但当前问答板一次只走一张…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 你希望 skill 有什么行为？（可选）
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案与代价
+      description: 有没有别的做法？各自的取舍是什么？（可选）
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: 约束确认
+      options:
+        - label: 该能力可以只用 Python 标准库实现（≥ 3.8，无第三方依赖）
+          required: false
+        - label: 该能力所需的接口已在本仓库 `references/api-contracts.md` 的公开端点内
+          required: false

@@ -1,0 +1,25 @@
+# 自动标签：任何改动先给一个 `needs-triage`，由维护者细化
+"needs-triage":
+  - "*"
+
+"documentation":
+  - changed-files:
+      - any-glob-to-any-file: "**/*.md"
+
+"skill":
+  - changed-files:
+      - any-glob-to-any-file: "skills/noova-generation/**"
+
+"tests":
+  - changed-files:
+      - any-glob-to-any-file: "tests/**"
+
+"ci":
+  - changed-files:
+      - any-glob-to-any-file: ".github/workflows/**"
+
+"security":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "SECURITY.md"
+          - "skills/noova-generation/scripts/noova_common.py"
