@@ -419,12 +419,12 @@ class ProbeTest(unittest.TestCase):
     def test_server_message_with_link_is_redacted_not_dropped(self):
         """服务端消息含链接时**脱敏后保留**，不再整条丢弃（曾经的「一泄露一丢信息」）。"""
         body = (r'{"code": 401, "data": null, '
-                r'"message": "Key 已停用，详见 https://internal-oss.internal-corp.com/bucket"}')
+                r'"message": "Key 已停用，详见 https://internal-oss.aliyuncs.com/bucket"}')
         with mock.patch.object(noova_key, "open_credentialed",
                                side_effect=self._http_error(401, body)):
             result = noova_key._probe("https://noova.vip/api/v1/credit", key="sk-x")
         self.assertIn("Key 已停用", result["reason"])
-        self.assertNotIn("internal-corp.com", result["reason"])
+        self.assertNotIn("aliyuncs.com", result["reason"])
         self.assertIn("media.example.com", result["reason"])
 
     def test_probe_refuses_local_base_without_any_request(self):

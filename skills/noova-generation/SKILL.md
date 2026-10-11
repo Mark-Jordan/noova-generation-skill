@@ -219,7 +219,7 @@ python3 <SKILL_DIR>/scripts/noova_key.py doctor          # 九项自检：Python
 - `--model` **必须由用户选定后显式传入**（见「标准工作流 §1」）。省略时脚本会退化为"自动选择该类型下
   第一个上线模型"并把所选模型打印到 stderr——这只允许在用户已明确授权"你来挑"时使用，
   **不得**作为默认路径。
-- **模型编码 / 线路名可能含空格**（如 `Acme Image 2.5 alpha`、`Acme Image 2.5 beta`、
+- **模型编码 / 线路名可能含空格**（如 `Acme Image 2.5 flare`、`Acme Image 2.5 sunburst`、
   `Acme Vision 2.1` 这类）。拼命令时给 `--model` / `--code` 的值**加引号**，
   否则 shell 会把编码拆成多个参数、脚本按用法错误退出。
 - `--param 名称=值` 可重复，用于传模型参数（名称与取值**必须**来自 `params` 查询结果）。

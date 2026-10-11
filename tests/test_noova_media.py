@@ -68,7 +68,7 @@ DEMO_SPEC = {
     "model": "demo-model",
     "modelType": "image",
     "displayName": "Demo Image",
-    "line": "标准线路-甲线",
+    "line": "特价1K-flare",
     "status": "online",
     "protocols": ["openai", "anthropic"],
     "billing": {"mode": "per_request", "price": 15.0, "unit": 1},
@@ -104,7 +104,7 @@ class NormalizeModelTest(unittest.TestCase):
         model = spec_model()
         self.assertEqual(model["code"], "demo-model")
         self.assertEqual(model["display_name"], "Demo Image")
-        self.assertEqual(model["line"], "标准线路-甲线")
+        self.assertEqual(model["line"], "特价1K-flare")
         self.assertEqual(model["model_type"], "image")
         self.assertEqual(model["status"], "online")
         self.assertEqual(model["protocols"], ["openai", "anthropic"])
@@ -571,7 +571,7 @@ class FriendlyErrorTest(unittest.TestCase):
         self.assertEqual(err.code, 401)
         self.assertIn("api_control", err.hint)
 
-    def test_network_policy_block_detected(self):
+    def test_cloudflare_block_detected(self):
         err = nm._friendly_error(403, "error code: 1010", None, None)
         self.assertIn("网络策略拦截", err.message)
 
@@ -1010,7 +1010,7 @@ class ModelsListingTest(unittest.TestCase):
          "surchargeRules": [],
          "params": [{"name": "prompt", "type": "string", "required": True}]},
         {"model": "m2", "displayName": "M Two", "modelType": "image",
-         "line": "标准线路-甲线",
+         "line": "特价1K-flare",
          "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 15.0, "unit": 1},
          "surchargeRules": [],
@@ -1018,7 +1018,7 @@ class ModelsListingTest(unittest.TestCase):
                     {"name": "referenceImages", "type": "string[]",
                      "required": False}]},
         {"model": "m3", "displayName": "M Three", "modelType": "video",
-         "line": "标准线路-乙线",
+         "line": "性价比-0.25/s",
          "status": "maintenance", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
@@ -1057,8 +1057,8 @@ class ModelsListingTest(unittest.TestCase):
         整表折行），改为该行下方一条子行。
         """
         _, out = self._render(["models"])
-        self.assertIn("↳ 线路：标准线路-甲线", out)
-        self.assertIn("↳ 线路：标准线路-乙线", out)
+        self.assertIn("↳ 线路：特价1K-flare", out)
+        self.assertIn("↳ 线路：性价比-0.25/s", out)
         self.assertNotIn("↳ 线路：默认", out)   # m1 无线路且族内唯一 → 不打印子行
 
     def test_listing_shows_surcharge_rules(self):
@@ -1092,8 +1092,8 @@ class ModelsListingTest(unittest.TestCase):
         self.assertEqual(by_code["m1"]["ability"], [])           # 无参考类参数 → 无能力标签
         self.assertEqual(by_code["m2"]["ability"], ["参考图"])
         # 线路：原样透出 + 展示名 + 族键 + 近似消耗，四件套缺一不可
-        self.assertEqual(by_code["m2"]["line"], "标准线路-甲线")
-        self.assertEqual(by_code["m2"]["line_label"], "标准线路-甲线")
+        self.assertEqual(by_code["m2"]["line"], "特价1K-flare")
+        self.assertEqual(by_code["m2"]["line_label"], "特价1K-flare")
         self.assertEqual(by_code["m2"]["family"], "image:M Two")
         self.assertEqual(by_code["m2"]["approximate_credit"]["kind"], "exact")
         self.assertEqual(by_code["m1"]["line"], "")
@@ -1155,7 +1155,7 @@ class ListingWidthRegressionTest(unittest.TestCase):
          "billing": {"mode": "per_token",
                      "pricePer1M": {"input": 520.0, "output": 2650.0}},
          "surchargeRules": [], "params": []},
-        {"model": "demo-image-2.5-standard", "displayName": "Demo Image 2.5",
+        {"model": "demo-image-2.5-sunburst", "displayName": "Demo Image 2.5",
          "modelType": "image", "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 20.0, "unit": 1},
          "surchargeRules": [], "params": []},
@@ -1191,7 +1191,7 @@ class ListingWidthRegressionTest(unittest.TestCase):
         """单位属于图例，不属于每一行——重复即把表撑爆。"""
         out = self._render()
         rows = [line for line in out.splitlines()
-                if line.strip().startswith(("（无编码，不可调用）", "demo-image-2.5-standard",
+                if line.strip().startswith(("（无编码，不可调用）", "demo-image-2.5-sunburst",
                                             "demo-video-2.0-mini-720p"))]
         self.assertEqual(len(rows), 3)
         for row in rows:
@@ -1354,7 +1354,7 @@ class FormPanelTest(unittest.TestCase):
         return [nm._normalize_model(item) for item in (
             # 同名 + 同编码族、两条不同线路：这是生产真实形状（同一展示名多条编码）
             self._raw("img-a", name="Demo Image", params=self.IMAGE_PARAMS,
-                      line="标准线路-甲线"),
+                      line="特价1K-flare"),
             self._raw("img-c", name="Demo Image", price=20.0, line="1K线路-特价"),
             self._raw("img-b", name="Retired", status="maintenance"),
             self._raw("", name="Mystery"),                       # 平台没给调用编码
@@ -1405,7 +1405,7 @@ class FormPanelTest(unittest.TestCase):
         by_code = {o["value"]: o for o in panel["options"]}
         self.assertEqual(by_code["img-a"]["billing"], "15 积分/次")
         self.assertEqual(by_code["img-c"]["billing"], "20 积分/次")
-        self.assertEqual(by_code["img-a"]["line_label"], "标准线路-甲线")
+        self.assertEqual(by_code["img-a"]["line_label"], "特价1K-flare")
         self.assertEqual(by_code["img-c"]["line_label"], "1K线路-特价")
         self.assertEqual(by_code["img-a"]["family"], "image:Demo Image")
         self.assertEqual(by_code["img-a"]["credit_estimate"], "15 积分/次")
@@ -1684,7 +1684,7 @@ class LineListingTest(unittest.TestCase):
 
     SPECS = [
         {"model": "vd-a", "displayName": "Demo Video 2.5", "modelType": "video",
-         "line": "高清线路-甲线x", "status": "online", "protocols": ["openai"],
+         "line": "满血720p-0.6/s", "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
                              "charge": "multiply_by_value", "multiplier": 60.0,
@@ -1693,7 +1693,7 @@ class LineListingTest(unittest.TestCase):
                     {"name": "duration", "type": "number", "required": True,
                      "min": 4, "max": 15}]},
         {"model": "vd-b", "displayName": "Demo Video 2.5", "modelType": "video",
-         "line": "标准线路-乙线", "status": "online", "protocols": ["openai"],
+         "line": "性价比-0.25/s", "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
                              "charge": "multiply_by_value", "multiplier": 25.0,
@@ -1701,8 +1701,8 @@ class LineListingTest(unittest.TestCase):
          "params": [{"name": "prompt", "type": "string", "required": True},
                     {"name": "duration", "type": "number", "required": True,
                      "min": 4, "max": 15}]},
-        {"model": "txt-a", "displayName": "Demo Text", "modelType": "text",
-         "line": "优惠线路", "status": "online", "protocols": ["anthropic"],
+        {"model": "glm", "displayName": "GLM 5.3", "modelType": "text",
+         "line": "优惠低价", "status": "online", "protocols": ["anthropic"],
          "billing": {"mode": "per_token",
                      "pricePer1M": {"input": 90.0, "output": 260.0}},
          "surchargeRules": [],
@@ -1726,8 +1726,8 @@ class LineListingTest(unittest.TestCase):
 
     def test_every_line_of_the_same_model_is_listed(self):
         out = self._render(["models"])
-        self.assertIn("↳ 线路：高清线路-甲线x", out)
-        self.assertIn("↳ 线路：标准线路-乙线", out)
+        self.assertIn("↳ 线路：满血720p-0.6/s", out)
+        self.assertIn("↳ 线路：性价比-0.25/s", out)
 
     def test_line_subline_carries_the_approximate_cost_and_its_basis(self):
         out = self._render(["models"])
@@ -1737,8 +1737,8 @@ class LineListingTest(unittest.TestCase):
     def test_line_subline_omits_the_cost_when_it_is_only_qualitative(self):
         """`按量计费（按 token 用量结算）` 与同行「计价」列重复，子行不再重复。"""
         out = self._render(["models"])
-        self.assertIn("↳ 线路：优惠线路\n", out)          # 行尾直接换行 ⇒ 没附消耗
-        self.assertNotIn("↳ 线路：优惠线路 ・", out)
+        self.assertIn("↳ 线路：优惠低价\n", out)          # 行尾直接换行 ⇒ 没附消耗
+        self.assertNotIn("↳ 线路：优惠低价 ・", out)
 
     def test_no_subline_when_the_model_has_one_unnamed_line(self):
         out = self._render(["models"])
@@ -1753,8 +1753,8 @@ class LineListingTest(unittest.TestCase):
     def test_json_carries_line_family_and_approximate_credit(self):
         items = json.loads(self._render(["models", "--json"]))
         by_code = {item["model_code"]: item for item in items}
-        self.assertEqual(by_code["vd-a"]["line"], "高清线路-甲线x")
-        self.assertEqual(by_code["vd-a"]["line_label"], "高清线路-甲线x")
+        self.assertEqual(by_code["vd-a"]["line"], "满血720p-0.6/s")
+        self.assertEqual(by_code["vd-a"]["line_label"], "满血720p-0.6/s")
         self.assertEqual(by_code["vd-a"]["family"], "video:Demo Video 2.5")
         self.assertEqual(by_code["vd-b"]["family"], by_code["vd-a"]["family"])
         self.assertEqual(by_code["vd-a"]["approximate_credit"]["kind"], "range")
@@ -1773,14 +1773,14 @@ class ModelFormLineTest(unittest.TestCase):
             "line": line, "status": "online", "protocols": ["openai"],
             "billing": {"mode": "per_request", "price": price, "unit": 1},
             "surchargeRules": [], "params": []})
-            for code, line, price in (("vd-std", "平台线路-甲线甲乙丙", 25.0),
-                                      ("vd-kd", "高清线路-甲线x", 60.0))]
+            for code, line, price in (("vd-std", "官方渠道720p-0.25/s", 25.0),
+                                      ("vd-kd", "满血720p-0.6/s", 60.0))]
 
     def test_every_option_carries_line_and_approximate_credit(self):
         panel = nm.build_model_form("video", self._models())
         by_code = {o["value"]: o for o in panel["options"]}
-        self.assertEqual(by_code["vd-std"]["line_label"], "平台线路-甲线甲乙丙")
-        self.assertEqual(by_code["vd-kd"]["line_label"], "高清线路-甲线x")
+        self.assertEqual(by_code["vd-std"]["line_label"], "官方渠道720p-0.25/s")
+        self.assertEqual(by_code["vd-kd"]["line_label"], "满血720p-0.6/s")
         self.assertEqual(by_code["vd-std"]["credit_estimate"], "25 积分/次")
         self.assertEqual(by_code["vd-kd"]["credit_estimate"], "60 积分/次")
         self.assertEqual(by_code["vd-std"]["family"], "video:Demo Video 2.5")
@@ -1813,8 +1813,8 @@ class ModelFormLineTest(unittest.TestCase):
             nm._render_form(panel)
         text = out.getvalue()
         self.assertIn("2 条线路", text)
-        self.assertIn("平台线路-甲线甲乙丙", text)
-        self.assertIn("高清线路-甲线x", text)
+        self.assertIn("官方渠道720p-0.25/s", text)
+        self.assertIn("满血720p-0.6/s", text)
         too_wide = [(nm._display_width(line), line) for line in text.splitlines()
                     if nm._display_width(line) > 80]
         self.assertEqual(too_wide, [], f"超过 80 列的行：{too_wide}")
