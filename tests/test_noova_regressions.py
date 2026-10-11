@@ -735,6 +735,195 @@ class PromptValidationTest(unittest.TestCase):
         self.assertNotIn("--param prompt", str(ctx.exception))
 
 
+class EnumValueVsLabelTest(unittest.TestCase):
+    """枚举参数的「取值」与「展示标签」不得混用（真实缺陷，已线上复现）。
+
+    复现链：参数面板把 `1280x720` 渲染成它的标签 `16:9` → agent 照抄
+    `--param aspect_ratio=16:9` → 平台判定取值非法，**HTTP 400**。
+    实测平台上有 6 个模型存在 `value != label` 的参数（比例类像素串），
+    且集中在图像模型上。
+    """
+
+    LABELS = {"1280x720": "16:9", "720x1280": "9:16"}
+
+    def _model(self):
+        return nm._normalize_model({
+            "model": "img-x", "displayName": "Img X", "modelType": "image",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 6.0, "unit": 1},
+            "surchargeRules": [],
+            "params": [{"name": "prompt", "type": "string", "required": True,
+                        "label": "提示词"},
+                       {"name": "aspect_ratio", "type": "string", "required": False,
+                        "label": "比例", "values": ["auto", "1280x720", "720x1280"],
+                        "valueLabels": self.LABELS}]})
+
+    # ---- A) 人读面板必须给出「可传的取值」 ----
+
+    def test_human_panel_shows_the_value_not_only_the_label(self):
+        """修复前：面板只打印 `16:9`，用户/agent 照抄即成非法取值。"""
+        import contextlib
+        import io
+        panel = nm.build_param_form(self._model())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            nm._render_form(panel)
+        text = out.getvalue()
+        self.assertIn("1280x720", text, "人读面板丢了可传取值")
+        self.assertIn("16:9", text, "人读面板丢了展示标签")
+
+    def test_json_and_human_panels_agree_on_the_value(self):
+        """两条渲染口径不得再分叉（JSON 一直是对的，错的只有人读那条）。"""
+        import contextlib
+        import io
+        panel = nm.build_param_form(self._model())
+        field = next(f for f in panel["fields"] if f["name"] == "aspect_ratio")
+        self.assertEqual([o["value"] for o in field["options"]],
+                         ["auto", "1280x720", "720x1280"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            nm._render_form(panel)
+        for option in field["options"]:
+            self.assertIn(option["value"], out.getvalue())
+
+    def test_choice_values_never_exceed_80_columns(self):
+        """取值多时也要折行：实测 14 个取值的 `取值（标签）` 单行可达 280 列，
+        终端折行把取值与标签拆散，反而更容易抄错（本版缺陷的成因之一）。"""
+        import contextlib
+        import io
+        model = nm._normalize_model({
+            "model": "img-z", "displayName": "Img Z", "modelType": "image",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 1.0, "unit": 1},
+            "surchargeRules": [],
+            "params": [{"name": "aspect_ratio", "type": "string", "required": False,
+                        "label": "比例",
+                        "values": [f"{1000 + i}x{2000 + i}" for i in range(20)],
+                        "valueLabels": {f"{1000 + i}x{2000 + i}": f"ratio-{i}"
+                                        for i in range(20)}}]})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            nm._render_form(nm.build_param_form(model))
+        too_wide = [(nm._display_width(line), line) for line in out.getvalue().splitlines()
+                    if nm._display_width(line) > 80]
+        self.assertEqual(too_wide, [], f"超过 80 列的行：{too_wide}")
+        # 折行不得吃掉任何取值
+        for i in range(20):
+            self.assertIn(f"{1000 + i}x{2000 + i}", out.getvalue())
+
+    def test_fixed_field_keeps_printing_the_value(self):
+        """`fixed` 分支一直打印 value——修 choice 时不得把它改坏。"""
+        import contextlib
+        import io
+        model = nm._normalize_model({
+            "model": "img-y", "displayName": "Img Y", "modelType": "image",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 1.0, "unit": 1},
+            "surchargeRules": [],
+            "params": [{"name": "resolution", "type": "string", "required": False,
+                        "label": "分辨率", "values": ["720p"]}]})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            nm._render_form(nm.build_param_form(model))
+        self.assertIn("720p", out.getvalue())
+
+    # ---- C) 发请求前必须按契约预检取值，不得白跑一次往返 ----
+
+    def _args(self, **kw):
+        base = {"param": [], "prompt": "x", "ref_image": None,
+                "ref_video": None, "ref_audio": None}
+        base.update(kw)
+        return mock.Mock(**base)
+
+    def test_label_instead_of_value_is_rejected_before_the_request(self):
+        """修复前：本地不校验，一路发到平台才 400。"""
+        args = self._args(param=[("aspect_ratio", "16:9")])
+        with self.assertRaises(nm.NoovaError) as ctx:
+            nm._ensure_param_values(self._model(), args)
+        rendered = ctx.exception.render()
+        self.assertIn("取值不合法", rendered)
+        self.assertIn("1280x720", rendered, "报错必须给出合法取值")
+        self.assertIn("1280x720", rendered)
+
+    def test_label_misuse_hint_names_the_correct_value(self):
+        """把标签当取值传是最高频误用：提示要直接给出「应传什么」。"""
+        args = self._args(param=[("aspect_ratio", "16:9")])
+        with self.assertRaises(nm.NoovaError) as ctx:
+            nm._ensure_param_values(self._model(), args)
+        self.assertIn("标签", ctx.exception.hint or "")
+        self.assertIn("1280x720", ctx.exception.hint or "")
+
+    def test_legal_value_passes(self):
+        args = self._args(param=[("aspect_ratio", "1280x720")])
+        nm._ensure_param_values(self._model(), args)   # 不抛异常
+
+    def test_free_text_param_is_never_blocked(self):
+        """`values` 为空 = 自由文本，任何情况下都不得被本地拦下。"""
+        args = self._args(param=[("quality", "whatever-the-user-wants")])
+        nm._ensure_param_values(self._model(), args)
+
+    def test_unknown_param_name_is_not_blocked_locally(self):
+        """契约外的参数名交给平台判定（平台是静默忽略，不阻断）。"""
+        args = self._args(param=[("not_in_contract", "anything")])
+        nm._ensure_param_values(self._model(), args)
+
+    def test_numeric_normalization_matches_the_platform(self):
+        """平台比较取值时会归一化（`5.0` == `5`），本地预检必须同口径，否则误拦。"""
+        self.assertEqual(nm._normalize_option_key("5.0"), nm._normalize_option_key(5))
+        self.assertEqual(nm._normalize_option_key(True), "true")
+        self.assertEqual(nm._normalize_option_key(" 1280x720 "), "1280x720")
+        model = nm._normalize_model({
+            "model": "v1", "displayName": "V", "modelType": "video",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 1.0, "unit": 1},
+            "surchargeRules": [],
+            "params": [{"name": "duration", "type": "number", "required": False,
+                        "label": "时长", "values": [5, 10]}]})
+        nm._ensure_param_values(model, self._args(param=[("duration", "5.0")]))
+
+    def test_no_contract_means_no_validation(self):
+        model = nm._normalize_model({
+            "model": "n1", "displayName": "N", "modelType": "image",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 1.0, "unit": 1},
+            "surchargeRules": [], "params": []})
+        nm._ensure_param_values(model, self._args(param=[("aspect_ratio", "16:9")]))
+
+
+class DeterministicErrorMustNotSuggestRetryTest(unittest.TestCase):
+    """确定性失败不得附「建议 N 秒后重试」。
+
+    修复前：400 也把网关的 `Retry-After: 60` 透成重试建议——而取值非法的请求
+    重试一万次都是 400。实测 401 也带同一个头，可见该头与「可否恢复」无关。
+    """
+
+    def test_400_does_not_suggest_a_retry(self):
+        err = nm._friendly_error(400, "参数 比例 取值不合法", None, 60)
+        self.assertIsNone(err.retry_after)
+        self.assertNotIn("建议", err.render(), "不得给出「建议 N 秒后重试」")
+        self.assertIn("取值", err.hint or "")
+
+    def test_403_and_404_stay_silent_about_retry(self):
+        for code in (400, 403, 404, 422):
+            err = nm._friendly_error(code, "x", None, 60)
+            self.assertIsNone(err.retry_after, f"HTTP {code} 是确定性失败")
+            self.assertNotIn("建议 60 秒后重试", err.render())
+
+    def test_rate_limit_still_suggests_a_retry(self):
+        err = nm._friendly_error(429, "too many", None, 30)
+        self.assertEqual(err.retry_after, 30)
+        self.assertIn("重试", err.render())
+
+    def test_server_error_still_suggests_a_retry(self):
+        for code in (500, 503, 504):
+            err = nm._friendly_error(code, "", None, None)
+            self.assertIsNotNone(err.retry_after, f"HTTP {code} 是暂时性失败，应可重试")
+
+    def test_platform_quota_still_suggests_a_retry(self):
+        err = nm._friendly_error(503, "", {"data": {"source": "platform_quota"}}, None)
+        self.assertEqual(err.retry_after, 60)
+
+
 class Python38CompatibilityTest(unittest.TestCase):
     """静态守住 Python 3.8 兼容性（CI 还会在真实的 3.8 上跑一遍）。
 

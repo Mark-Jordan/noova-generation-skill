@@ -5,7 +5,7 @@ license: MIT — see the LICENSE file in this repository.
 compatibility: "需要 Python ≥ 3.8（仅标准库，无第三方依赖）；运行时需能访问 https://noova.vip 或 https://noova.live。"
 metadata:
   author: NooVa AI
-  version: "1.9.2"
+  version: "1.9.3"
 ---
 
 # NooVa AI 生成调用（公开 API）
@@ -283,7 +283,15 @@ python3 <SKILL_DIR>/scripts/noova_media.py form --code <模型编码> --json
      - `fixed` —— **只有一个取值：要显示给用户看，但不可选**（`note` 已写明"必须使用它，无需选择"）。
      - `number` —— 数值区间（`range` 给出上下限），让用户给一个数。
      - `text` / `list` —— 自由填写；`list` 可传多个，支持公网 URL 或本地文件路径。
+   - **`options[]` 里 `value` 与 `label` 是两个东西，绝不能混用**：
+     - **`value` 才是要传给 `--param` 的合法取值**；`label` **仅供向用户展示**，传它必被平台拒绝。
+     - 两者不同时（图像模型的 `aspect_ratio` 几乎都是这种形态），向用户展示**用 `label`**，
+       拼命令时**用 `value`**——例如用户说"16:9"，命令里要写 `--param aspect_ratio=1280x720`。
+     - 展示时把两个都给出来（`value（label）`），避免用户以为 `label` 就是能填的值。
+     - 契约取值来自平台配置，**不要**把 `label` 当取值反查、也不要自己造一个像素串。
    - `required: true` 的项**必须**有值，缺了脚本会拒发请求。
+   - **取值合法性由脚本按契约预检**：传了不在 `values` 里的值，脚本发请求前就拒发并列出合法取值
+     （不会浪费一次往返，也不会扣费）。看到该报错就回到面板重新取值，**不要原样重试**。
    - `hidden_fields` 是脚本自动处理的字段（如 `model`），**不要拿去问用户**。
    - `fields` 为空时按 `empty_note` 说明该模型无额外参数，只需提示词。
 4. **确认后立即生成**：把参数面板给用户看时，**必须**同时给出面板里的 `confirm_hint`

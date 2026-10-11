@@ -412,7 +412,19 @@ def _friendly_error(code: int, message: str, payload: object, retry_after: int |
     if code in (500, 502, 503, 504):
         return NoovaError(detail or "服务暂时不可用", code=code, retry_after=retry_after or 5,
                           hint="请稍后重试；连续失败可联系官方支持")
-    return NoovaError(detail or f"请求失败（HTTP {code}）", code=code, retry_after=retry_after)
+    if code == 400:
+        # **确定性失败：重试永远不会变好。** 平台对 400 也照样回 `Retry-After`，
+        # 若把它透成「建议 N 秒后重试」，会把「改参数」误导成「等一等再试」
+        # （实测：比例传展示标签 → 400 + Retry-After: 60，而重试恒为 400）。
+        return NoovaError(detail or "请求参数不合法", code=code,
+                          hint="请按该模型的运行时参数契约核对参数名与取值："
+                               "params --code <模型编码> --json（本类错误重试无效）")
+    if code in (408, 425):
+        # 超时/过早重发属于**可重放**失败：保留 Retry-After 的提示才成立。
+        return NoovaError(detail or f"请求失败（HTTP {code}）", code=code,
+                          retry_after=retry_after or 5)
+    # 其余 4xx 同为确定性失败：不透传 retry_after，避免诱导无意义重试。
+    return NoovaError(detail or f"请求失败（HTTP {code}）", code=code)
 
 
 def _build_request(path: str, *, key: str | None, body: object = None, method: str = "GET",
@@ -2509,6 +2521,28 @@ def build_type_form(models: list[dict]) -> dict:
     return payload
 
 
+def _print_wrapped_values(lead: str, items: list[str], *, sep: str = " / ",
+                          limit: int = 80) -> None:
+    """打印「一行放不下」的取值列表，续行缩进到取值起始列。
+
+    排版纪律与本模块其它输出一致：每行不超过 `limit` 列（中文按 2 列计）。
+    实测图像模型的 `aspect_ratio` 有 14 个取值，`取值（标签）` 形态单行可达 280 列——
+    终端折行会把取值与标签拆散，用户/agent 反而更容易抄错（这正是本版要修的缺陷的
+    成因之一）。单个取值本身就超长时不强拆，照样打印。
+    """
+    indent = " " * _display_width(lead)
+    line = lead
+    for index, item in enumerate(items):
+        piece = item if index == 0 else sep + item
+        if index and _display_width(line) + _display_width(piece) > limit:
+            print(line)
+            line = indent + item
+        else:
+            line += piece
+    if line.strip():
+        print(line)
+
+
 def _render_form(payload: dict) -> None:
     """`form` 的人类可读渲染（agent 应优先用 `--json`，这里便于人工核对）。
 
@@ -2553,16 +2587,23 @@ def _render_form(payload: dict) -> None:
             if field["kind"] == "fixed":
                 values = f"固定值 {field['options'][0]['value']}（不可选）"
             elif field["kind"] == "choice":
-                values = "可选：" + " / ".join(
-                    o["label"] if o["label"] != o["value"] else o["value"]
-                    for o in field["options"])
+                # **用户要传的是 `value`，`label` 只是展示标签**——传 label 会被平台判为
+                # 非法取值（实测：比例传 `16:9` 而契约取值是 `1280x720`，必然 400）。
+                # 两者不同时按 `value（label）` 一并给出，与 `params` / `model` 同一口径。
+                values = None
             elif field["kind"] == "number" and field["range"]:
                 values = f"数值 {_fmt_num(field['range'][0])}~{_fmt_num(field['range'][1])}"
             elif field["kind"] == "list":
                 values = "多个值（URL 或本地路径）"
             else:
                 values = "自由填写"
-            print(f"  {_pad(field['name'], 20)} {mark}  {values}")
+            if values is None:
+                _print_wrapped_values(
+                    f"  {_pad(field['name'], 20)} {mark}  可选：",
+                    [f"{o['value']}（{o['label']}）" if o["label"] != o["value"] else str(o["value"])
+                     for o in field["options"]])
+            else:
+                print(f"  {_pad(field['name'], 20)} {mark}  {values}")
             label = str(field.get("label") or "")
             detail = field["note"]
             if label and label != field["name"]:
@@ -2809,12 +2850,113 @@ def _ensure_required_params(model: dict, args, *, kind: str = "media") -> None:
     )
 
 
+def _normalize_option_key(value: object) -> str | None:
+    """把取值归一化成可比较的 key（与平台侧校验同一口径）。
+
+    平台比较取值时会做等价的归一化（布尔转 `true`/`false`、数值去掉无意义的
+    `.0` 与尾零），所以这里的预检必须同样处理——否则 `--param duration=5.0`
+    会被本地误判为非法，而平台其实接受。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number.is_integer():
+            return str(int(number))
+        text = f"{number}"
+        return text if "e" in text.lower() else text.rstrip("0").rstrip(".")
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in ("true", "false"):
+        return lowered
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if number.is_integer():
+        return str(int(number))
+    rendered = f"{number}"
+    return rendered if "e" in rendered.lower() else rendered.rstrip("0").rstrip(".")
+
+
+def _ensure_param_values(model: dict, args) -> None:
+    """发请求前核对「枚举参数的取值」是否在契约 `values` 里。
+
+    为什么必须在本地拦：契约里的 `values` 才是合法取值，而**展示标签**（`valueLabels`，
+    如像素串 `1280x720` 的标签 `16:9`）长得更像人话，极易被当成可传值——实测图像模型的
+    `aspect_ratio` 传标签必然拿到 HTTP 400，白跑一次往返。
+
+    保守放行原则（宁可少拦，不可误拦）：
+      - 参数不在契约里 → 不管（平台对未知键是**静默忽略**，文档已声明，不阻断）；
+      - 契约 `values` 为空   → 该参数是自由文本，不校验；
+      - 数组型参数          → 元素逐个比（`--ref-image` 那类走专门选项，一般不在此路径）。
+    """
+    params = model.get("params") or []
+    if not params:
+        return
+    by_name = {p.get("name"): p for p in params}
+    problems: list[tuple[str, list[str], list[str]]] = []
+    for name, value in _parse_param_pairs(getattr(args, "param", None)).items():
+        param = by_name.get(name)
+        if not param:
+            continue
+        allowed = [str(v).strip() for v in (param.get("values") or []) if str(v).strip()]
+        if not allowed:
+            continue  # 自由文本参数：无枚举可校验
+        allowed_keys = {_normalize_option_key(v) for v in allowed}
+        given = value if isinstance(value, list) else [value]
+        if all(_normalize_option_key(item) in allowed_keys for item in given):
+            continue
+        labels = param.get("value_labels") if isinstance(param.get("value_labels"), dict) else {}
+        # 展示一律用 `取值（标签）`：用户真正要传的是取值，标签只帮他对上话。
+        shown = [f"{v}（{labels[v]}）" if labels.get(v) else v for v in allowed]
+        problems.append((name, given, shown))
+
+    if not problems:
+        return
+
+    # 命中「用户把标签当取值传了」时给一条针对性的提示——这是最高频的误用。
+    misused: list[str] = []
+    for name, given, _ in problems:
+        param = by_name.get(name) or {}
+        labels = param.get("value_labels") if isinstance(param.get("value_labels"), dict) else {}
+        for item in given:
+            for value, label in labels.items():
+                if label and _normalize_option_key(label) == _normalize_option_key(item):
+                    misused.append(f"{name}={item} → 应传 {value}")
+    hint = ("取值必须在契约的 values 里，valueLabels 只是展示标签、不能当取值传："
+            "form --code <模型编码> --json")
+    if misused:
+        hint = "你把展示标签当成取值传了——" + "、".join(misused) + "。以契约 values 为准。"
+
+    raise NoovaError(
+        "参数取值不合法："
+        + "；".join(
+            f"{name} 当前值 {_fmt_value_for_error(given)}，可选值 {'、'.join(shown)}"
+            for name, given, shown in problems),
+        hint=hint,
+        details=["参数取值一律以该模型的运行时参数契约为准",
+                 f"查看契约：params --code {model.get('code', '<模型编码>')} --json"],
+    )
+
+
+def _fmt_value_for_error(values: list) -> str:
+    """把非法取值渲染成人读形态（单值不加括号，多值逗号分隔）。"""
+    texts = [str(v) for v in values]
+    return texts[0] if len(texts) == 1 else "[" + ", ".join(texts) + "]"
+
+
 def _run_media(args, model_type: str) -> int:
     key = _require_key()
     model = _resolve_model(args.model, model_type, quiet=getattr(args, "quiet", False))
     if model["status"] and model["status"] != CALLABLE_MODEL_STATUS:
         raise NoovaError(f"模型「{model['code']}」当前状态为「{_status_label(model['status'])}」，暂不可调用")
     _ensure_required_params(model, args)
+    _ensure_param_values(model, args)
     payload = _build_media_payload(args, key, model)
     # 生成前取一次余额快照：终态后再取一次，两者差值即「本次扣减」（真实、可核对）。
     credit_before = None if args.no_credit else fetch_credit(key)
@@ -2936,6 +3078,8 @@ def cmd_chat(args) -> int:
     # 文本路径同样做「发请求前核对必填参数」：媒体路径一直有，文本路径曾经没有，
     # 于是缺 `images` 之类必填项的请求会白等一轮才拿到上游 400。
     _ensure_required_params(model, args, kind="chat")
+    # 枚举取值同样在本地按契约预检（与媒体路径同源）：传展示标签必被平台 400 拒绝。
+    _ensure_param_values(model, args)
 
     protocol, path = select_chat_protocol(model, args.protocol)
     images = [_resolve_reference(value, key) for value in getattr(args, "image", None) or []]
