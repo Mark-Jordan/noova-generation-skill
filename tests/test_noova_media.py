@@ -571,7 +571,7 @@ class FriendlyErrorTest(unittest.TestCase):
         self.assertEqual(err.code, 401)
         self.assertIn("api_control", err.hint)
 
-    def test_cloudflare_block_detected(self):
+    def test_network_policy_block_detected(self):
         err = nm._friendly_error(403, "error code: 1010", None, None)
         self.assertIn("网络策略拦截", err.message)
 

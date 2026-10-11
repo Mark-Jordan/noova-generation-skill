@@ -306,16 +306,16 @@ class KeyPrecedenceTest(unittest.TestCase):
 class JsonRedactionTest(unittest.TestCase):
     def test_internal_host_is_redacted_in_json_payload(self):
         payload = {"status": "succeeded", "gateway": "internal-gw.corp.local",
-                   "note": "see https://internal-oss.aliyuncs.com/bucket/x"}
+                   "note": "see https://internal-oss.internal-corp.com/bucket/x"}
         safe = nm._safe_obj(payload)
         text = json.dumps(safe, ensure_ascii=False)
         self.assertNotIn("internal-gw.corp.local", text)
-        self.assertNotIn("aliyuncs.com", text)
+        self.assertNotIn("internal-corp.com", text)
         self.assertIn("media.example.com", text)
 
     def test_media_urls_are_preserved_verbatim(self):
         """铁律 7：结果 URL 是功能字段，必须原样交付。"""
-        url = "https://bucket-9.internal-oss.aliyuncs.com/out/a.png"
+        url = "https://bucket-9.internal-oss.internal-corp.com/out/a.png"
         payload = {"status": "succeeded", "result": url, "results": [{"url": url}]}
         safe = nm._safe_obj(payload)
         self.assertEqual(safe["result"], url)
