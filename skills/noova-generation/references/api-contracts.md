@@ -25,8 +25,8 @@
 | **对外**（本 skill 唯一可用） | API Key 调用方 | `Authorization: Bearer sk-…` | `/api/models/params`、`/api/models`、`/v1/models`、`/api/v1/invoke`、`/v1/content`、`/api/v1/credit`、`/api/v1/gateway/validate-key` |
 | 对内 | 官网前端控制台 | 用户**登录 token** | （不适用；本 skill 一律不访问，不在此罗列） |
 
-> **「线路」也不需要访问对内链路**：线路（`line`）已由对外契约 `/api/models/params` 下发（见 §2.1）。
-> 需要线路时用对外字段，**不要**为了拿线路去访问任何对内端点。
+> **同名模型的区分不需要访问对内链路**：对外契约给出的是每个模型自己的 `model` 编码。
+> 需要区分同名模型时**按编码选**，**不要**为了拿展示标签去访问任何对内端点。
 
 ## 1. 鉴权
 
@@ -68,13 +68,13 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `model` | string | **对外模型编码**（请求时原样使用；空串 = 平台未给编码，**不可调用**） |
-| `displayName` | string | 展示名。**同名模型真实存在**（同一展示名可能对应多条线路，编码不同） |
-| `line` | string | **线路**：同一模型的接入通道名。空串 = 运营未填，展示为「默认」 |
+| `displayName` | string | 展示名。**同名模型真实存在**（同一展示名可能对应多个模型，`model` 编码不同） |
 | `modelType` | string | `text` / `image` / `video` / `audio` |
 | `status` | string | `online`（在线，可调用）/ `maintenance`（维护中，暂不可调用）。**对外只呈现这两类**：`test` / `deprecated` 等状态在取数入口（`_fetch_public_model_specs`）即被过滤，不会进入任何输出；展示时必须注明是「在线」还是「维护中」 |
 | `protocols` | string[] | 该模型支持的协议，**第一项即主协议** |
 | `billing` | object | 计费（见 §2.4） |
-| `surchargeRules` | array | 参数加收规则（见 §2.4） |
+| `surchargeRules` | array | 参数加收规则（**明细、非权威**，见 §2.4） |
+| `pricing` | object | **服务端算好的权威价**（见 §2.4.1）；给不出确定值时为 `credits: null` + `note` |
 | `params` | array | 参数契约（见 §2.2） |
 
 ### 2.2 `params[]` 参数契约
@@ -87,6 +87,8 @@
 | `label` | string | 该参数的中文名（可为空） |
 | `values` | array | **平台配置的**可选值；空数组 = 自由文本 |
 | `valueLabels` | object | 取值 → 中文标签（如 `{"16:9": "横屏"}`） |
+| `optionVisibleWhen` | array | **与 `values` 同序等长**的条件数组（无条件的项为 `null`）；用于按档位分组，详见 `parameters.md` §1.1 |
+| `visibleWhen` | object | 字段级可见条件 `{when, operator, value}`；当前生产极少出现 |
 | `min` / `max` | number | 数值型参数的上下限（仅数值类型出现） |
 | `minItems` / `maxItems` | int | 数组型参数的元素个数上下限（仅数组类型出现） |
 
@@ -97,7 +99,10 @@
 ### 2.3 `GET /api/models`（鉴权）
 
 对外最小清单，用于轻量列举与**连通性探测**（**需要有效 Key**；无 Key → 401）：
-`model` / `modelType` / `status` / `priceOnce` / `priceType` / `priceToken`。
+`model` / `modelType` / `status` / `priceOnce` / `priceType` / `priceToken` / `priceSecond` / `surchargeRules` / `priceDisplayText`。
+
+`priceOnce` 是**底价**（不含参数加收）；带参数组合的权威价走
+`GET /api/models/params?model=<编码>&params=<URL-encoded JSON>` 的 `pricing`。
 
 ### 2.4 计费字段怎么读（**决定报价对不对**）
 
@@ -118,6 +123,11 @@
 | `multiplier` / `base` | 加收 = `base + 取值 × multiplier`（**`base` 缺省按 0 算**） |
 | `credits` | `charge=fixed` 时的固定加收积分 |
 
+> 规则的来源有两类，**都是真值**：① 平台显式配置的参数计费规则；
+> ② 由模型选项上的「选项加价」（`add_price`）合成的等价 `exact` + `fixed` 规则。
+> 第二类保证「契约标价」与「实际结算」口径一致，不需要调用方额外加价。
+> 详见 `parameters.md` §5。
+
 **读法与红线**：
 
 1. `per_token` → 用 `pricePer1M` 报「输入 X / 输出 Y 积分/百万 tokens」，并说明"以实际用量结算"，
@@ -127,6 +137,25 @@
 4. **报价必须把 `surchargeRules` 算进去**：用户选定参数后按上述公式合并基础价与加收，
    再把结果转述给用户；只报基础单价会**系统性低估**费用。
 5. **换算人民币用 `creditPerYuan`**（当前 100，即 **100 积分 = 1 元**），报钱数时把比例一并说清。
+
+### 2.4.1 `pricing`：服务端算好的权威价（优先用它，不要自己算）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `exact` | bool | `true` = 这组参数的**计费口径确定**，该数字即实际扣费；`false` = 不是最终金额 |
+| `credits` | number\|null | 积分数；`null` = 服务端给不出确定值（见 `note`），**绝不可当成 0 或免费** |
+| `yuan` | number\|null | `credits / creditPerYuan` |
+| `quotedParams` | object | 计算所用的参数组合（canonical 名，已回显） |
+| `note` | string\|null | 给不出确定值的原因（面向调用方，无内部信息） |
+
+- 不传 `?params=` 时是**默认组合**报价；参数决定价格而参数缺失、或模型按 token 结算时
+  `credits` 为 `null` —— 此时按 §2.4 的规则定性说明，**不要编数字**。
+- 问「我这组参数要花多少」用 `?model=<编码>&params=<URL-encoded JSON 对象>`；
+  `credit_estimate_text` 会自动优先使用它，**调用方不需要自己按 `surchargeRules` 算**。
+- `exact: true` 的**前置条件**：按 `quotedParams` 这组参数计费；多传/少传参数金额会变。
+  它**不保证请求本身会被接受**——必填参数仍须齐全（缺了必填项平台会拒绝，也就没有扣费）。
+- `surchargeRules` 只是**明细**，保留用于对账与自建 UI；本地复算仅是旧后端的兜底路径
+  （见 `parameters.md` §5）。
 
 ### 2.5 `GET /v1/models`
 

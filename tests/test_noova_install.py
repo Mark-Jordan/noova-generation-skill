@@ -867,7 +867,6 @@ class PackageTest(unittest.TestCase):
         for name in names:
             self.assertNotIn("/tests/", name)
             self.assertFalse(name.endswith("install.py"))
-            self.assertFalse(name.endswith("install.py"))
             self.assertFalse(name.endswith(installer.MANIFEST_NAME))
 
     def test_package_refuses_broken_skill(self):

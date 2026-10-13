@@ -30,10 +30,9 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | `model_code` | 模型编码（请求时原样使用） |
 | `callable` | `false` = 平台未给该模型调用编码，**不能调用** |
 | `display_name` / `model_type` / `status` | 名称 / 类型 / 状态 |
-| `line` / `line_label` | **线路**：`line` 是契约原文（运营手填，可能为空串）；`line_label` 是展示名，空串时回退为「默认」 |
-| `family` | 同族键：`<类型>:<显示名>`。同族内即同一模型的各条线路 |
-| `siblings[]` | **同模型的其它线路**（每条含 `model_code` / `line_label` / `price_cell` / `approximate_credit`） |
-| `approximate_credit` | **选线路阶段的近似消耗**（见下） |
+| `family` | 同族键：`<类型>:<显示名>`，**仅用于同名提示分组**，不参与选择与计价 |
+| `siblings[]` | **同名其它模型**（每条含 `model_code` / `price_cell` / `approximate_credit`） |
+| `approximate_credit` | **选模型阶段的近似消耗**（见下） |
 | `ability` | 能力标签（**由参数契约推导**，不是平台字段） |
 | `protocols` / `primary_protocol` | 支持的协议列表；**`protocols[0]` 即主协议** |
 | `invocation` | 调用方式：`mode`（`sync`/`task`）、`create`、`poll`、`stream_supported`、`eta_seconds`、`default_max_wait`、`routes` |
@@ -49,7 +48,10 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | `range` | 加收参数在契约里有 `min`/`max`，能算出区间 | 报 `text`（如 `约 260~1950 积分/次`），`detail` 是依据（`duration 4~30 × 65 积分`） |
 | `usage` | 按 token 结算，或边界推不出来 | **只给定性文案**（`按用量计价（见加收规则）`），**绝不可编数字** |
 
-参数定好后的**精确价**由 `billing` + `surchargeRules` 算（§5）。
+参数定好后优先用**服务端权威价**：`form --code <编码> --param 名=值 --json` 的
+`credit_estimate_text` 会先向服务端询价（`GET /api/models/params?model=&params=`）并照抄
+`pricing.credits`；只有旧后端没有 `pricing` 块时才回退到按 `billing` + `surchargeRules`
+的本地预估（文案会明确写「按契约预估」，见 §5）。
 
 `params --json` 的 `params[]` 每项结构：
 
@@ -61,12 +63,37 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | `label` | 该参数的中文名 | 直接用于向用户解释；为空时脚本回退到内置名表 |
 | `values` | **平台配置的**可选值数组；自由文本参数为空数组 | 非空时**全部**列给用户，不要只给前几个 |
 | `valueLabels` | 取值 → 中文标签（如 `{"16:9": "横屏"}`） | 有标签时用标签解释该取值 |
+| `optionVisibleWhen` | **与 `values` 同序等长的平行数组**，第 i 项是第 i 个取值的可见条件 | 用于把取值**按档位分组**（见 §1.1）；无条件的项为 `null` |
+| `visibleWhen` | **字段级**可见条件（`{when, operator, value}`） | 该字段只在条件成立时适用；当前生产极少见 |
 | `min` / `max` | 数值型参数的上下限 | 只在 `type` 为数值类时出现 |
 | `minItems` / `maxItems` | 数组型参数的元素个数上下限 | 只在数组类型时出现 |
 
 > **没有 `description`，也没有"从说明文本推导的候选值"**：契约里 `values` 是平台自己配置的枚举，
 > 它就是权威取值集合。**`values` 为空 = 该参数是自由文本，无固定取值**——
 > 此时如实说"无固定取值"，**任何情况下都不要编造枚举**。
+
+### 1.1 参数依赖（`optionVisibleWhen`）：为什么必须"同序平行数组"
+
+`optionVisibleWhen` 是**与 `values` 同长度、同顺序**的数组：第 i 项描述 `values[i]`
+什么时候可见。**它不能写成 `{取值: 条件}` 的字典**——生产 `gpt-image-2-stable` 的
+`aspect_ratio` 有 40 个取值，其中 `auto` 在 1K / 2K / 4K 三档**各出现一次、规则各不相同**，
+字典会把重复取值覆盖掉两档。
+
+条件形态（`when` / `operator` / `value`）：
+
+| `operator` | 含义 | 是否带 `value` |
+|---|---|---|
+| `eq` | 控制器取值**等于** `value`（默认） | 是 |
+| `ne` | 控制器取值**不等于** `value` | 是 |
+| `filled` | 控制器**已填写**（非空、非空串、非空数组） | 否 |
+| `empty` | 控制器**未填写** | 否 |
+
+**平台的行为（决定面板不能强制用户先选）**：取值不在当前可见集合里、且集合非空 → `400`；
+但**控制器缺席时集合为空 → 平台保守放行**（`schema_constraints` 的「无可见选项时不强制」）。
+所以面板的正确做法是：**按档位分组展示、提示先选控制器、但不阻拦用户直接选任意档里的值**。
+
+单值参数（`values` 恰好 1 个）**照常参与条件求值**：它不进面板，但脚本会自动采用它的唯一取值。
+生产 4 个图像模型的 `aspect_ratio` 分档依据 `imageSize` 正是单值参数，不带入就一个选项都出不来。
 
 示例（形态参考）：
 
@@ -105,8 +132,8 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | "某个参数能填什么？" | 给出 `values` 全部取值（`valueLabels` 有标签就带上）；`values` 为空才说"自由文本，无固定取值" |
 | "这个参数（值）是什么意思？" | 用 `label` 解释；`label` 不足时坦诚说明平台未展开说明，**不要臆测** |
 | "不传这个参数行不行？" | `required=false` → 可以省略；`true` → 必须传 |
-| "有哪些模型？" | 跑 `models` 后按**类型分区**回答，给出编码、名称、协议、状态与计价；**同名多线路的模型把每条线路都列出（线路名 + 编码 + 计价）**；并说明"清单实时变化" |
-| "同名模型怎么区分？" | **靠模型编码与线路（`line`）**。对外契约有 `line` 字段，展示为「线路名」，空串则显示「默认」。用 `models` 看同一模型名下有几条线路，再按编码选一条。注意：**线路文本里的数字不能当单价**（运营手填、会过期），计价真值只有 `billing` + `surchargeRules` |
+| "有哪些模型？" | 跑 `models` 后按**类型分区**回答，给出编码、名称、协议、状态与计价；同名模型会带族标题，把同名的每个编码与计价都列出；并说明"清单实时变化" |
+| "同名模型怎么区分？" | **只靠模型编码**。`models` 把同名的一组摆在一起并给出各自编码与计价，`params --code <编码>` 拿到单个模型的契约。编码就是请求里要传的 `model` 值，是唯一可靠的选择键（不引入任何展示用的近似标签） |
 | "大概要多久？" | 按类型给区间（文本 1–10 秒首字符；图像 30 秒–5 分钟；音频 30 秒–10 分钟；视频 1 分钟–1.5 小时），并强调"以实际任务为准" |
 | "要花多少积分？" | 引用 `billing.text`（口径见 §5）；实际消耗以生成结束时的「本次扣减（余额差值）」为准 |
 | "推荐哪个模型？" | 可以按 `models` 返回的类型/计价信息给出建议，但**必须先说明依据**，不要编造性能排名 |
@@ -141,7 +168,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 
    - 所以：**向用户展示用标签，拼命令用取值**。用户说"要 16:9"，命令写
      `--param aspect_ratio=1280x720`。
-   - 两者不同的情形**集中在图像模型的比例参数**（同名不同线路的标签还带
+   - 两者不同的情形**集中在图像模型的比例参数**（同名模型的标签还带
      `1k-` / `4K-` 前缀）；视频模型的 `aspect_ratio` 通常 `values` 本身就是 `16:9`
      这类比例串，**不要**把图像上的经验套到视频上——**一切以该模型契约的 `values` 为准**。
    - 脚本会**发请求前**按契约预检取值：不在 `values` 里的值直接拒发并列出合法取值，
@@ -202,6 +229,9 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | `multiplier` / `base` | 倍数与基数：加收 = `base + 取值 × multiplier`（`base` 缺省按 0 算） |
 | `credits` | `charge=fixed` 时的固定加收积分 |
 
+规则有两个来源，**都已包含在本字段里、不需要再另加**：① 平台显式配置的时长/取值加收；
+② 由模型**选项上的「选项加价」**合成的等价 `exact` + `fixed` 规则（保证契约标价与实扣一致）。
+
 **读法与红线**：
 
 1. `mode = per_token` → 用 `price_per_1m` 报「输入 X / 输出 Y 积分/百万 tokens」，并说明"以实际用量结算"。
@@ -210,8 +240,13 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 2. `mode = per_request` / `per_time` 且 `price > 0` → 「X 积分/次」（`unit > 1` 时写「X 积分/N 次」）。
 3. **`price = 0` → 绝不能说「0 积分/次」或"免费"**：这表示单价改由 `surcharge_rules`
    按用量（时长等）计价。此时引用 `surcharge_text`，或如实说"以平台当前计价为准"。
-4. **报价必须把加收算进去**：用户选定参数后，用 `form --code <编码> --param 名=值 --json` 拿
-   `credit_estimate_text`，它已按上述公式把基础价与加收合并成一句可直接转述的话。
+4. **报价优先用服务端权威价**：用户选定参数后，用 `form --code <编码> --param 名=值 --json` 拿
+   `credit_estimate_text`——它先向服务端询价，成功时文案是「**服务端权威价**：N 积分」
+   （`pricing.credits`，由服务端真实结算函数算出，**调用方不要自己算**）；
+   服务端给不出确定值时如实说明原因（`credits: null` + `note`）；
+   只有旧后端没有 `pricing` 块时才回退本地复算，文案是「**按契约预估**」。
+   真实扣费以生成结束时的「本次扣减（账户余额差值）」为准。
+   单值参数已自动并入报价（`preset_params`），不需要用户提供。
 5. **积分换算成人民币时用 `credit_per_yuan`**（当前 100，即 **100 积分 = 1 元**）。
    报钱数时把换算比例一并说清，避免用户拿积分当"元"理解。
 

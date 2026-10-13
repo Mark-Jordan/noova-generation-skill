@@ -11,6 +11,23 @@
 
 ---
 
+## 1.10.0 — 2026-10-13
+
+**参数依赖（选项分档）贯通面板 + 单值参数自动采用 + 两项计费修复（含对外契约变更）**
+
+对外契约 `GET /api/models/params` 从本版起**不再下发 `line`（线路）**；同名模型一律
+靠 `model` 编码区分。同一次变更里新增了参数依赖字段，修复了两个计费缺陷。
+
+- 新增 `optionVisibleWhen`（与 `values` 同序等长的平行数组）与字段级 `visibleWhen`，
+  面板改为按控制器取值分档（`depends_on` / `option_groups` / `active_group`）；
+- `values` 恰好 1 个的参数不进面板，改为进 `preset_params` 由脚本自动写入请求体；
+- 面板字段按依赖拓扑排序（控制器在依赖项之前，同级必填在前）；
+- 修复精确报价在契约缺 `base` 键时直接报错退出（线上缺陷，影响 4 个时长加收模型）；
+- 修 `exact` 规则取值比较为归一化口径（`5.0` == `5`）；
+- 报价改为优先引用服务端算好的 `pricing.credits`，`surchargeRules` 降级为明细（非权威）。
+
+详见 `skills/noova-generation/references/changelog.md`。
+
 ## 1.9.3 — 2026-10-11
 
 **枚举参数「取值」与「展示标签」混用（含行为变更）**

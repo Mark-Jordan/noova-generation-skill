@@ -68,7 +68,6 @@ DEMO_SPEC = {
     "model": "demo-model",
     "modelType": "image",
     "displayName": "Demo Image",
-    "line": "特价1K-flare",
     "status": "online",
     "protocols": ["openai", "anthropic"],
     "billing": {"mode": "per_request", "price": 15.0, "unit": 1},
@@ -104,7 +103,6 @@ class NormalizeModelTest(unittest.TestCase):
         model = spec_model()
         self.assertEqual(model["code"], "demo-model")
         self.assertEqual(model["display_name"], "Demo Image")
-        self.assertEqual(model["line"], "特价1K-flare")
         self.assertEqual(model["model_type"], "image")
         self.assertEqual(model["status"], "online")
         self.assertEqual(model["protocols"], ["openai", "anthropic"])
@@ -127,21 +125,53 @@ class NormalizeModelTest(unittest.TestCase):
     def test_contract_never_invents_fields(self):
         """契约没给的字段就是没有：不合成 ability / description / doc。
 
-        `line`（线路）是**契约显式提供的字段**，不在「不许发明」的名单里。
+        `line`（线路）自 v1.10.0 起**已不在对外契约里**，同样属于「不许出现」的字段，
+        与 `ability` / `description` 归为一类。
         """
         model = spec_model()
         for absent in ("ability", "description", "doc", "request_format",
-                       "cost_text", "alt_codes"):
+                       "cost_text", "alt_codes", "line", "line_label"):
             self.assertNotIn(absent, model)
+        # 旧后端曾下发 `line`：现在即使给了也必须被忽略，不得重新进入内部字典。
+        legacy = dict(DEMO_SPEC)
+        legacy["line"] = "旧版线路"
+        self.assertNotIn("line", nm._normalize_model(legacy))
 
-    def test_line_falls_back_to_empty_string(self):
-        """旧后端没有 `line`：落成空串，由展示层退回「默认」，**不 fail-closed**。
+    def test_param_carries_condition_visibility(self):
+        """`optionVisibleWhen` 与 `values` **同序等长**；长度不等时按 values 对齐补 None。
 
-        线路只影响展示与选择，不影响报价正确性，缺了它不该让整条链路报错。
+        错位的后果是把 A 档的规则安到 B 档的取值上，用户按面板选出来的值会被平台 400。
+        `None` 的语义是「无条件可见」（与后端默认放行一致），所以异常只会多显示。
         """
-        model = nm._normalize_model({k: v for k, v in DEMO_SPEC.items() if k != "line"})
-        self.assertEqual(model["line"], "")
-        self.assertEqual(nm.line_label(model), "默认")
+        model = spec_model(params=[
+            {"name": "imageSize", "type": "string", "required": False,
+             "values": ["1K", "2K"]},
+            {"name": "aspect_ratio", "type": "string", "required": True,
+             "values": ["1024x1024", "auto", "auto"],
+             "optionVisibleWhen": [
+                 {"when": "imageSize", "operator": "eq", "value": "1K"},
+                 {"when": "imageSize", "operator": "eq", "value": "1K"}]},
+        ])
+        ratio = {p["name"]: p for p in model["params"]}["aspect_ratio"]
+        self.assertEqual(len(ratio["option_visible_when"]), 3)          # 按 values 对齐
+        self.assertIsNone(ratio["option_visible_when"][2])              # 缺的补 None
+        # 规则多于 values 时按 values 截断，绝不越界
+        self.assertEqual(nm._align_option_visible_when([{"when": "a"}], 0), [])
+        self.assertEqual(nm._align_option_visible_when(None, 2), [None, None])
+        self.assertEqual(nm._align_option_visible_when(["x", {"when": "a"}], 2),
+                         [None, {"when": "a"}])
+
+    def test_field_level_visible_when_is_carried(self):
+        """字段级 `visibleWhen` 同族落库；没有则明确为 None（不是缺键）。"""
+        model = spec_model(params=[
+            {"name": "quality", "type": "string", "required": False,
+             "values": ["high"], "visibleWhen": {"when": "mode", "operator": "filled"}},
+            {"name": "prompt", "type": "string", "required": True},
+        ])
+        by_name = {p["name"]: p for p in model["params"]}
+        self.assertEqual(by_name["quality"]["visible_when"],
+                         {"when": "mode", "operator": "filled"})
+        self.assertIsNone(by_name["prompt"]["visible_when"])
 
     def test_empty_model_code_stays_empty(self):
         """生产确有 `model_code` 为空的模型（`the model 5` 等），必须原样保留空串。"""
@@ -340,6 +370,80 @@ class CreditCostTest(unittest.TestCase):
         text = nm.credit_estimate_text(model, {})
         self.assertIn("200 积分 = 1 元", text)
         self.assertIn("0.5 元", text)
+
+    # ── 服务端出数（计划 §4.5）：权威价优先、拿不到才回退预估 ──────────
+
+    def test_estimate_text_prefers_server_authoritative_price(self):
+        """服务端给了 pricing.credits → 照抄权威价，且不再出现「预估」字样。"""
+        model = spec_model(billing={"mode": "per_request", "price": 125.0, "unit": 1})
+        text = nm.credit_estimate_text(
+            model,
+            {},
+            pricing={"exact": True, "credits": 22.0, "yuan": 0.22, "note": None},
+        )
+        self.assertIn("服务端权威价：22 积分", text)
+        self.assertIn("0.22 元", text)
+        self.assertNotIn("预估", text)
+
+    def test_estimate_text_uses_contract_pricing_when_params_absent(self):
+        """不传参数时用契约里的默认组合价（contract pricing 块）。"""
+        model = spec_model(billing={"mode": "per_request", "price": 125.0, "unit": 1},
+                           pricing={"exact": True, "credits": 20.0})
+        self.assertIn("20 积分", nm.credit_estimate_text(model, {}))
+
+    def test_estimate_text_reports_null_without_inventing_number(self):
+        """服务端明确给不出确定值 → 如实说明，绝不编一个数字（F-5）。"""
+        model = spec_model(billing={"mode": "per_request", "price": 0.0, "unit": 1})
+        text = nm.credit_estimate_text(
+            model,
+            {},
+            pricing={"exact": False, "credits": None, "note": "该模型价格取决于参数：duration"},
+        )
+        self.assertIn("服务端未给出确定金额", text)
+        self.assertIn("duration", text)
+
+    def test_estimate_text_falls_back_to_local_estimate_for_old_backend(self):
+        """旧后端无 pricing 块 → 回退本地预估，文案必须带「预估」。"""
+        model = spec_model(billing={"mode": "per_request", "price": 125.0, "unit": 1})
+        text = nm.credit_estimate_text(model, {}, pricing=None)
+        self.assertIn("按契约预估", text)
+
+    def test_fetch_pricing_is_fail_soft(self):
+        model = spec_model()
+        with mock.patch.object(nm, "_request", side_effect=nm.NoovaError("boom")):
+            self.assertIsNone(nm.fetch_pricing(model))
+
+    def test_fetch_pricing_passes_model_and_params_and_reads_block(self):
+        model = spec_model()
+        captured: dict = {}
+
+        def fake_request(method, path, **kwargs):
+            captured["path"] = path
+            return {
+                "data": {
+                    "models": [
+                        {"model": "demo-model", "pricing": {"exact": True, "credits": 22.0}}
+                    ]
+                }
+            }
+
+        with mock.patch.object(nm, "_require_key", return_value="sk-x"), \
+                mock.patch.object(nm, "_request", side_effect=fake_request):
+            pricing = nm.fetch_pricing(model, {"imageSize": "4K"})
+        self.assertEqual(pricing["credits"], 22.0)
+        self.assertIn("model=demo-model", captured["path"])
+        self.assertIn("params=", captured["path"])
+        self.assertIn("%22imageSize%22", captured["path"])
+
+    def test_fetch_pricing_returns_none_when_backend_lacks_pricing(self):
+        """旧后端返回的模型条目没有 pricing 块 → None（回退预估），不是抛错。"""
+        model = spec_model()
+
+        with mock.patch.object(nm, "_require_key", return_value="sk-x"), \
+                mock.patch.object(
+                    nm, "_request", return_value={"data": {"models": [{"model": "demo-model"}]}}
+                ):
+            self.assertIsNone(nm.fetch_pricing(model))
 
 
 class SanitizeTest(unittest.TestCase):
@@ -1010,7 +1114,6 @@ class ModelsListingTest(unittest.TestCase):
          "surchargeRules": [],
          "params": [{"name": "prompt", "type": "string", "required": True}]},
         {"model": "m2", "displayName": "M Two", "modelType": "image",
-         "line": "特价1K-flare",
          "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 15.0, "unit": 1},
          "surchargeRules": [],
@@ -1018,7 +1121,6 @@ class ModelsListingTest(unittest.TestCase):
                     {"name": "referenceImages", "type": "string[]",
                      "required": False}]},
         {"model": "m3", "displayName": "M Three", "modelType": "video",
-         "line": "性价比-0.25/s",
          "status": "maintenance", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
@@ -1050,16 +1152,15 @@ class ModelsListingTest(unittest.TestCase):
         self.assertIn("输入/输出，单位＝积分/百万 tokens", out)   # …图例必须把单位讲清楚
         self.assertIn("按用量计价", out)     # 按用量计价的权威文案
 
-    def test_listing_shows_every_line_of_a_model(self):
-        """线路是用户选择的一部分：同一模型的每条线路都必须出现。
+    def test_listing_never_prints_a_line_subline(self):
+        """对外契约已不下发线路：清单里任何形态的线路子行都不得再出现。
 
-        线路**不加列**（实测加列会把文本组撑到 113 列、视频组 96 列，80 列终端
-        整表折行），改为该行下方一条子行。
+        v1.10.0 前每个模型下方会多一行 `↳ 线路：<线路名>`；该字段是运营手填自由文本，
+        可能过期且不可用于计价，已从契约与全部出口删除。这里把「不许回来」钉死。
         """
         _, out = self._render(["models"])
-        self.assertIn("↳ 线路：特价1K-flare", out)
-        self.assertIn("↳ 线路：性价比-0.25/s", out)
-        self.assertNotIn("↳ 线路：默认", out)   # m1 无线路且族内唯一 → 不打印子行
+        self.assertNotIn("线路", out)
+        self.assertNotIn("↳", out.replace("↳ 加收：", ""))   # 加收子行保留，线路子行不保留
 
     def test_listing_shows_surcharge_rules(self):
         _, out = self._render(["models"])
@@ -1091,13 +1192,12 @@ class ModelsListingTest(unittest.TestCase):
         self.assertEqual(by_code["m1"]["invocation_mode"], "sync")
         self.assertEqual(by_code["m1"]["ability"], [])           # 无参考类参数 → 无能力标签
         self.assertEqual(by_code["m2"]["ability"], ["参考图"])
-        # 线路：原样透出 + 展示名 + 族键 + 近似消耗，四件套缺一不可
-        self.assertEqual(by_code["m2"]["line"], "特价1K-flare")
-        self.assertEqual(by_code["m2"]["line_label"], "特价1K-flare")
+        # 族键（同名分组用）与近似消耗必须在；线路相关键必须已彻底消失。
         self.assertEqual(by_code["m2"]["family"], "image:M Two")
         self.assertEqual(by_code["m2"]["approximate_credit"]["kind"], "exact")
-        self.assertEqual(by_code["m1"]["line"], "")
-        self.assertEqual(by_code["m1"]["line_label"], "默认")
+        for absent in ("line", "line_label"):
+            self.assertNotIn(absent, by_code["m2"])
+            self.assertNotIn(absent, by_code["m1"])
 
 class RequestSignatureTest(unittest.TestCase):
     """回归：非流式 chat 曾因 `_request()` 不接收 `extra_headers` 而必然 TypeError。
@@ -1341,10 +1441,10 @@ class FormPanelTest(unittest.TestCase):
 
     @staticmethod
     def _raw(code, *, mtype="image", status="online", name="Demo Image",
-             price=15.0, params=None, rules=None, line=""):
+             price=15.0, params=None, rules=None):
         return {
             "model": code, "displayName": name, "modelType": mtype,
-            "line": line, "status": status, "protocols": ["openai"],
+            "status": status, "protocols": ["openai"],
             "billing": {"mode": "per_request", "price": price, "unit": 1},
             "surchargeRules": rules or [],
             "params": list(params if params is not None else []),
@@ -1352,10 +1452,9 @@ class FormPanelTest(unittest.TestCase):
 
     def _models(self):
         return [nm._normalize_model(item) for item in (
-            # 同名 + 同编码族、两条不同线路：这是生产真实形状（同一展示名多条编码）
-            self._raw("img-a", name="Demo Image", params=self.IMAGE_PARAMS,
-                      line="特价1K-flare"),
-            self._raw("img-c", name="Demo Image", price=20.0, line="1K线路-特价"),
+            # 同名 + 两条独立编码：这是生产真实形状（同一展示名对应多个模型）
+            self._raw("img-a", name="Demo Image", params=self.IMAGE_PARAMS),
+            self._raw("img-c", name="Demo Image", price=20.0),
             self._raw("img-b", name="Retired", status="maintenance"),
             self._raw("", name="Mystery"),                       # 平台没给调用编码
             self._raw("vid-a", mtype="video", name="Demo Video"),
@@ -1396,31 +1495,33 @@ class FormPanelTest(unittest.TestCase):
         self.assertIn("编码", reasons["Mystery"])
 
     def test_model_panel_carries_code_and_price_for_every_option(self):
-        """同名模型确实存在（同一展示名对应多条编码），只给名字用户没法区分。
+        """同名模型确实存在（同一展示名对应多个编码），只给名字用户没法区分。
 
-        区分依据是**线路 + 模型编码 + 计价**三件套；面板还必须先给出该线路的
-        近似消耗（参数还没定，所以是区间或定性），否则用户得先选完才知道多少钱。
+        区分依据只有**模型编码 + 计价**两件套（线路已从对外契约删除）；
+        面板还必须先给出该模型的近似消耗（参数还没定，所以是区间或定性），
+        否则用户得先选完才知道多少钱。
         """
         panel = nm.build_model_form("image", self._models())
         by_code = {o["value"]: o for o in panel["options"]}
         self.assertEqual(by_code["img-a"]["billing"], "15 积分/次")
         self.assertEqual(by_code["img-c"]["billing"], "20 积分/次")
-        self.assertEqual(by_code["img-a"]["line_label"], "特价1K-flare")
-        self.assertEqual(by_code["img-c"]["line_label"], "1K线路-特价")
         self.assertEqual(by_code["img-a"]["family"], "image:Demo Image")
         self.assertEqual(by_code["img-a"]["credit_estimate"], "15 积分/次")
         self.assertEqual(by_code["img-c"]["credit_estimate"], "20 积分/次")
         self.assertEqual(panel["duplicate_names"], ["Demo Image"])
-        self.assertIn("线路", panel["duplicate_note"])
         self.assertIn("模型编码", panel["duplicate_note"])
         self.assertIn("计价", panel["duplicate_note"])
+        for absent in ("line", "line_label"):
+            self.assertNotIn(absent, by_code["img-a"])
+            self.assertNotIn(absent, by_code["img-c"])
 
-    def test_model_panel_legend_only_when_a_model_has_several_lines(self):
-        """只有真的出现多线路时才解释线路口径，单线路面板不加噪音。"""
+    def test_model_panel_has_no_line_legend(self):
+        """线路口径整段下线：无论几个同名，都不再有 `line_legend`。"""
         multi = nm.build_model_form("image", self._models())
-        self.assertIn("线路", multi["line_legend"])
         single = nm.build_model_form("image", [self._model("img-a")])
+        self.assertNotIn("line_legend", multi)
         self.assertNotIn("line_legend", single)
+        self.assertNotIn("线路", str(multi))
 
     def test_model_panel_next_step_mentions_the_exact_price_later(self):
         """用户要知道：现在的价是近似值，参数定好后还会再报一次精确价。"""
@@ -1458,20 +1559,24 @@ class FormPanelTest(unittest.TestCase):
         self.assertTrue(panel["contract_available"])
         self.assertEqual(panel["hidden_fields"], ["model"])     # 上一步已选过，不再问
         self.assertNotIn("model", [f["name"] for f in panel["fields"]])
-        # 必填在前，同时保持契约内的相对顺序
+        # 必填在前，同时保持契约内的相对顺序；单值 `resolution` 不进面板
         self.assertEqual([f["name"] for f in panel["fields"]],
-                         ["prompt", "aspect_ratio", "resolution", "duration",
+                         ["prompt", "aspect_ratio", "duration",
                           "quality", "referenceImages"])
-        self.assertTrue(all(f["required"] for f in panel["fields"][:4]))
-        self.assertFalse(any(f["required"] for f in panel["fields"][4:]))
+        self.assertTrue(all(f["required"] for f in panel["fields"][:3]))
+        self.assertFalse(any(f["required"] for f in panel["fields"][3:]))
+        self.assertEqual(panel["preset_params"], {"resolution": "720p"})
 
-    def test_single_value_param_is_shown_but_not_selectable(self):
-        fields = {f["name"]: f for f in nm.build_param_form(self._model("img-a"))["fields"]}
-        fixed = fields["resolution"]
-        self.assertEqual(fixed["kind"], "fixed")
-        self.assertTrue(fixed["fixed"])
-        self.assertEqual([o["value"] for o in fixed["options"]], ["720p"])
-        self.assertIn("无需选择", fixed["note"])
+    def test_single_value_param_is_adopted_not_asked(self):
+        """单值参数不进面板，但**必须**自动采用并如实说明（三件套之一）。
+
+        面板里没有它、请求时却缺它，才是真正的缺陷（生产 7 个单值参数 5 个必填）。
+        """
+        panel = nm.build_param_form(self._model("img-a"))
+        self.assertEqual(panel["preset_params"], {"resolution": "720p"})
+        self.assertNotIn("resolution", [f["name"] for f in panel["fields"]])
+        self.assertIn("resolution=720p", panel["preset_note"])
+        self.assertIn("无需选择", panel["preset_note"])
 
     def test_range_param_is_a_number_not_an_enum(self):
         """`4~15` 是区间，不是「只有一个可选值」——不能渲染成不可选的枚举。"""
@@ -1601,7 +1706,7 @@ class FormPanelTest(unittest.TestCase):
         域名照样出现在用户可见输出里。这里给上游文本的每个字段都塞入内网地址，
         逐个面板、逐条路径核对——漏一处就是一个泄漏点。
 
-        `line`（线路）是 v1.8.0 新进对外契约的字段，同样要过一遍。
+        面板里所有字符串都来自上游，包括同名提示与参数说明——逐条过一遍。
         """
         import contextlib
         import io
@@ -1611,8 +1716,11 @@ class FormPanelTest(unittest.TestCase):
             {"name": "mode", "type": "string", "required": False,
              "label": "走 gw-internal.acme.com:8443",
              "values": ["fast", "slow"],
-             "valueLabels": {"fast": "https://internal.corp/fast"}},
-        ], line="https://internal.corp/line")
+             "valueLabels": {"fast": "https://internal.corp/fast"},
+             "optionVisibleWhen": [
+                 {"when": "imageSize", "operator": "eq",
+                  "value": "https://internal.corp/when"}]},
+        ])
         model = nm._normalize_model(raw)
         needles = ("internal.corp", "gw-internal.acme.com")
         panels = (nm.build_param_form(model),
@@ -1684,7 +1792,7 @@ class LineListingTest(unittest.TestCase):
 
     SPECS = [
         {"model": "vd-a", "displayName": "Demo Video 2.5", "modelType": "video",
-         "line": "满血720p-0.6/s", "status": "online", "protocols": ["openai"],
+         "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
                              "charge": "multiply_by_value", "multiplier": 60.0,
@@ -1693,7 +1801,7 @@ class LineListingTest(unittest.TestCase):
                     {"name": "duration", "type": "number", "required": True,
                      "min": 4, "max": 15}]},
         {"model": "vd-b", "displayName": "Demo Video 2.5", "modelType": "video",
-         "line": "性价比-0.25/s", "status": "online", "protocols": ["openai"],
+         "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
          "surchargeRules": [{"param": "duration", "match": "present",
                              "charge": "multiply_by_value", "multiplier": 25.0,
@@ -1702,13 +1810,13 @@ class LineListingTest(unittest.TestCase):
                     {"name": "duration", "type": "number", "required": True,
                      "min": 4, "max": 15}]},
         {"model": "glm", "displayName": "GLM 5.3", "modelType": "text",
-         "line": "优惠低价", "status": "online", "protocols": ["anthropic"],
+         "status": "online", "protocols": ["anthropic"],
          "billing": {"mode": "per_token",
                      "pricePer1M": {"input": 90.0, "output": 260.0}},
          "surchargeRules": [],
          "params": [{"name": "prompt", "type": "string", "required": True}]},
         {"model": "plain", "displayName": "Plain Image", "modelType": "image",
-         "line": "", "status": "online", "protocols": ["openai"],
+         "status": "online", "protocols": ["openai"],
          "billing": {"mode": "per_request", "price": 20.0, "unit": 1},
          "surchargeRules": [], "params": []},
     ]
@@ -1724,25 +1832,24 @@ class LineListingTest(unittest.TestCase):
             nm.cmd_models(args)
         return out.getvalue()
 
-    def test_every_line_of_the_same_model_is_listed(self):
+    def test_same_named_models_are_grouped_with_a_heading(self):
         out = self._render(["models"])
-        self.assertIn("↳ 线路：满血720p-0.6/s", out)
-        self.assertIn("↳ 线路：性价比-0.25/s", out)
+        self.assertIn("▸ Demo Video 2.5", out)
+        self.assertIn("同名 2 个", out)
+        self.assertIn("按编码区分", out)
+        # 单个模型（无同名）不加族标题，避免清单变吵。
+        self.assertNotIn("▸ Plain Image", out)
+        self.assertNotIn("▸ GLM 5.3", out)
 
-    def test_line_subline_carries_the_approximate_cost_and_its_basis(self):
-        out = self._render(["models"])
-        self.assertIn("约 240~900 积分/次（duration 4~15 × 60 积分）", out)
-        self.assertIn("约 100~375 积分/次（duration 4~15 × 25 积分）", out)
+    def test_listing_never_prints_a_line_subline(self):
+        """线路已下线：清单里不得再出现任何线路子行（含「默认」形态）。
 
-    def test_line_subline_omits_the_cost_when_it_is_only_qualitative(self):
-        """`按量计费（按 token 用量结算）` 与同行「计价」列重复，子行不再重复。"""
+        注意断言只看「线路」二字——「默认等待上限」是耗时小节的正常文案，
+        不能把整段输出都钉死。
+        """
         out = self._render(["models"])
-        self.assertIn("↳ 线路：优惠低价\n", out)          # 行尾直接换行 ⇒ 没附消耗
-        self.assertNotIn("↳ 线路：优惠低价 ・", out)
-
-    def test_no_subline_when_the_model_has_one_unnamed_line(self):
-        out = self._render(["models"])
-        self.assertNotIn("线路：默认", out)
+        self.assertNotIn("线路", out)
+        self.assertNotIn("line_label", out)
 
     def test_listing_stays_within_80_columns(self):
         out = self._render(["models"])
@@ -1750,61 +1857,60 @@ class LineListingTest(unittest.TestCase):
                     if "<子命令>" not in line and nm._display_width(line) > 80]
         self.assertEqual(too_wide, [], f"超过 80 列的行：{too_wide}")
 
-    def test_json_carries_line_family_and_approximate_credit(self):
+    def test_json_carries_family_and_approximate_credit_but_no_line(self):
         items = json.loads(self._render(["models", "--json"]))
         by_code = {item["model_code"]: item for item in items}
-        self.assertEqual(by_code["vd-a"]["line"], "满血720p-0.6/s")
-        self.assertEqual(by_code["vd-a"]["line_label"], "满血720p-0.6/s")
         self.assertEqual(by_code["vd-a"]["family"], "video:Demo Video 2.5")
         self.assertEqual(by_code["vd-b"]["family"], by_code["vd-a"]["family"])
         self.assertEqual(by_code["vd-a"]["approximate_credit"]["kind"], "range")
-        self.assertEqual(by_code["plain"]["line"], "")
-        self.assertEqual(by_code["plain"]["line_label"], "默认")
         self.assertEqual(by_code["plain"]["approximate_credit"]["kind"], "exact")
+        for code in ("vd-a", "vd-b", "glm", "plain"):
+            self.assertNotIn("line", by_code[code])
+            self.assertNotIn("line_label", by_code[code])
 
 
 class ModelFormLineTest(unittest.TestCase):
-    """模型面板：用户必须能按「线路」区分同名模型，并当场看到近似消耗。"""
+    """模型面板：用户必须能按**模型编码**区分同名模型，并当场看到近似消耗。"""
 
     @staticmethod
     def _models():
         return [nm._normalize_model({
             "model": code, "displayName": "Demo Video 2.5", "modelType": "video",
-            "line": line, "status": "online", "protocols": ["openai"],
+            "status": "online", "protocols": ["openai"],
             "billing": {"mode": "per_request", "price": price, "unit": 1},
             "surchargeRules": [], "params": []})
-            for code, line, price in (("vd-std", "官方渠道720p-0.25/s", 25.0),
-                                      ("vd-kd", "满血720p-0.6/s", 60.0))]
+            for code, price in (("vd-std", 25.0), ("vd-kd", 60.0))]
 
-    def test_every_option_carries_line_and_approximate_credit(self):
+    def test_every_option_carries_code_and_approximate_credit(self):
         panel = nm.build_model_form("video", self._models())
         by_code = {o["value"]: o for o in panel["options"]}
-        self.assertEqual(by_code["vd-std"]["line_label"], "官方渠道720p-0.25/s")
-        self.assertEqual(by_code["vd-kd"]["line_label"], "满血720p-0.6/s")
         self.assertEqual(by_code["vd-std"]["credit_estimate"], "25 积分/次")
         self.assertEqual(by_code["vd-kd"]["credit_estimate"], "60 积分/次")
         self.assertEqual(by_code["vd-std"]["family"], "video:Demo Video 2.5")
         self.assertNotIn("・", by_code["vd-std"]["credit_estimate"])   # 短文案不带依据
+        for absent in ("line", "line_label"):
+            self.assertNotIn(absent, by_code["vd-std"])
+            self.assertNotIn(absent, by_code["vd-kd"])
 
-    def test_line_legend_appears_only_when_a_model_has_several_lines(self):
+    def test_no_line_legend_in_the_panel(self):
         multi = nm.build_model_form("video", self._models())
-        self.assertIn("线路", multi["line_legend"])
         single = nm.build_model_form("video", self._models()[:1])
+        self.assertNotIn("line_legend", multi)
         self.assertNotIn("line_legend", single)
 
-    def test_duplicate_note_names_line_code_and_price(self):
+    def test_duplicate_note_names_code_and_price(self):
         panel = nm.build_model_form("video", self._models())
         self.assertEqual(panel["duplicate_names"], ["Demo Video 2.5"])
         note = panel["duplicate_note"]
-        self.assertIn("线路", note)
         self.assertIn("模型编码", note)
         self.assertIn("计价", note)
+        self.assertNotIn("线路", note)
 
     def test_next_step_promises_the_exact_price_after_params(self):
         panel = nm.build_model_form("video", self._models())
         self.assertIn("精确", panel["next_step"])
 
-    def test_human_render_groups_lines_under_one_family_header(self):
+    def test_human_render_groups_same_named_models_under_one_header(self):
         import contextlib
         import io
         panel = nm.build_model_form("video", self._models())
@@ -1812,12 +1918,364 @@ class ModelFormLineTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             nm._render_form(panel)
         text = out.getvalue()
-        self.assertIn("2 条线路", text)
-        self.assertIn("官方渠道720p-0.25/s", text)
-        self.assertIn("满血720p-0.6/s", text)
+        self.assertIn("同名 2 个", text)
+        self.assertIn("按编码选", text)
+        self.assertIn("vd-std", text)
+        self.assertIn("vd-kd", text)
+        self.assertNotIn("线路", text)
         too_wide = [(nm._display_width(line), line) for line in text.splitlines()
                     if nm._display_width(line) > 80]
         self.assertEqual(too_wide, [], f"超过 80 列的行：{too_wide}")
+
+
+class ParamDependencyTest(unittest.TestCase):
+    """参数依赖（`optionVisibleWhen`）：分档、命中、缺席不阻拦、拓扑排序。
+
+    这是 v1.10.0 的核心行为。生产实证：`gpt-image-2-stable` 的 `aspect_ratio` 有 40 个
+    取值，每个只属于 1K / 2K / 4K 三档之一（`auto` 三档各出现一次）；平铺出来用户
+    根本看不出该先选分辨率。
+    """
+
+    @staticmethod
+    def _model(option_visible_when, *, image_required=False, image_values=None):
+        return nm._normalize_model({
+            "model": "dep-image", "displayName": "Dep Image", "modelType": "image",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 20.0, "unit": 1},
+            "surchargeRules": [],
+            "params": [
+                {"name": "prompt", "type": "string", "required": True},
+                {"name": "imageSize", "type": "string", "required": image_required,
+                 "values": list(image_values or ["1K", "2K", "4K"])},
+                {"name": "aspect_ratio", "type": "string", "required": True,
+                 "values": ["1024x1024", "auto", "auto", "auto", "free"],
+                 "optionVisibleWhen": option_visible_when},
+            ]})
+
+    @staticmethod
+    def _rules():
+        # `auto` 在三档各出现一次、规则不同 —— 这正是「不能用字典」的原因。
+        return [
+            {"when": "imageSize", "operator": "eq", "value": "1K"},
+            {"when": "imageSize", "operator": "eq", "value": "1K"},
+            {"when": "imageSize", "operator": "eq", "value": "2K"},
+            {"when": "imageSize", "operator": "eq", "value": "4K"},
+            None,
+        ]
+
+    def _field(self, model, **kw):
+        panel = nm.build_param_form(model, **kw)
+        return {f["name"]: f for f in panel["fields"]}["aspect_ratio"], panel
+
+    def test_option_groups_split_by_controller_value(self):
+        field, _ = self._field(self._model(self._rules()))
+        self.assertEqual(field["depends_on"], "imageSize")
+        heads = [g["when"]["value"] if g["when"] else None
+                 for g in field["option_groups"]]
+        # 1K 档拿到两个值（含重复出现的 `auto`）；无规则值另立一组。
+        self.assertEqual(heads, ["1K", "2K", "4K", None])
+        by_head = {g["when"]["value"] if g["when"] else None: g for g in field["option_groups"]}
+        self.assertEqual([o["value"] for o in by_head["1K"]["options"]],
+                         ["1024x1024", "auto"])
+        self.assertEqual([o["value"] for o in by_head["4K"]["options"]], ["auto"])
+        self.assertEqual([o["value"] for o in by_head[None]["options"]], ["free"])
+        # 全集必须保留（向后兼容），且顺序与契约一致。
+        self.assertEqual([o["value"] for o in field["options"]],
+                         ["1024x1024", "auto", "auto", "auto", "free"])
+
+    def test_active_group_follows_the_chosen_controller_value(self):
+        model = self._model(self._rules())
+        _, panel = self._field(model, chosen_params={"imageSize": "2K"})
+        field = {f["name"]: f for f in panel["fields"]}["aspect_ratio"]
+        heads = [g["when"]["value"] if g["when"] else None
+                 for g in field["option_groups"]]
+        self.assertEqual(field["active_group"], heads.index("2K"))
+
+    def test_controller_absent_hides_nothing_and_blocks_nothing(self):
+        """控制器没选 → 每一档都还在，`active_group` 为 None（不擅自替用户选一档）。"""
+        field, _ = self._field(self._model(self._rules()))
+        self.assertIsNone(field["active_group"])
+        self.assertEqual([o["value"] for o in field["options"]],
+                         ["1024x1024", "auto", "auto", "auto", "free"])
+        self.assertEqual(len(field["option_groups"]), 4)
+
+    def test_human_render_prints_every_group_not_only_the_active_one(self):
+        import contextlib
+        import io
+        model = self._model(self._rules())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            nm._render_form(nm.build_param_form(model))
+        text = out.getvalue()
+        for head in ("[imageSize=1K]", "[imageSize=2K]", "[imageSize=4K]", "[无条件]"):
+            self.assertIn(head, text)
+        self.assertIn("先确定「imageSize」", text)
+        too_wide = [(nm._display_width(l), l) for l in text.splitlines()
+                    if nm._display_width(l) > 80]
+        self.assertEqual(too_wide, [], f"超过 80 列的行：{too_wide}")
+
+    def test_topology_puts_the_controller_before_its_dependent(self):
+        """控制器是可选、依赖项是必填：只按「必填优先」会把控制器排到后面。"""
+        model = self._model(self._rules(), image_required=False)
+        names = [f["name"] for f in nm.build_param_form(model)["fields"]]
+        self.assertLess(names.index("imageSize"), names.index("aspect_ratio"))
+
+    def test_dangling_or_cyclic_dependency_falls_back_without_losing_fields(self):
+        """契约由运营配置：依赖指向不存在的字段或成环时，退回原顺序且不丢字段。"""
+        dangling = self._model([{"when": "nope", "operator": "eq", "value": "x"}])
+        names = [f["name"] for f in nm.build_param_form(dangling)["fields"]]
+        self.assertEqual(sorted(names), ["aspect_ratio", "imageSize", "prompt"])
+        cyclic = nm._normalize_model({
+            "model": "cyc", "displayName": "Cyc", "modelType": "image",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 1.0, "unit": 1},
+            "surchargeRules": [],
+            "params": [
+                {"name": "a", "type": "string", "required": True, "values": ["x", "y"],
+                 "optionVisibleWhen": [
+                     {"when": "b", "operator": "eq", "value": "1"},
+                     {"when": "b", "operator": "eq", "value": "1"}]},
+                {"name": "b", "type": "string", "required": True, "values": ["1", "2"],
+                 "optionVisibleWhen": [
+                     {"when": "a", "operator": "eq", "value": "x"},
+                     {"when": "a", "operator": "eq", "value": "x"}]},
+            ]})
+        fields = nm.build_param_form(cyclic)["fields"]
+        self.assertEqual(sorted(f["name"] for f in fields), ["a", "b"])
+
+    def test_single_value_controller_feeds_the_visibility_evaluation(self):
+        """生产形状：`imageSize` 是单值（不进面板），但分档依据正是它。"""
+        model = self._model(self._rules(), image_values=["1K"])
+        panel = nm.build_param_form(model)
+        self.assertEqual(panel["preset_params"], {"imageSize": "1K"})
+        field = {f["name"]: f for f in panel["fields"]}["aspect_ratio"]
+        heads = [g["when"]["value"] if g["when"] else None
+                 for g in field["option_groups"]]
+        self.assertEqual(field["active_group"], heads.index("1K"))
+
+
+class SingleValuePresetTest(unittest.TestCase):
+    """单值参数：不进面板 + 自动带入载荷 + 必填校验同等对待（三件套缺一即死锁）。"""
+
+    SPEC = {
+        "model": "seedance-x", "displayName": "Seed X", "modelType": "video",
+        "status": "online", "protocols": ["openai"],
+        "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
+        "surchargeRules": [{"param": "duration", "match": "present",
+                            "charge": "multiply_by_value", "multiplier": 25.0}],
+        "params": [
+            {"name": "prompt", "type": "string", "required": True},
+            {"name": "resolution", "type": "string", "required": True,
+             "values": ["720p"]},
+            {"name": "duration", "type": "number", "required": True, "min": 4, "max": 15},
+        ]}
+
+    def _model(self):
+        return nm._normalize_model(dict(self.SPEC))
+
+    def test_single_value_goes_to_preset_not_fields(self):
+        panel = nm.build_param_form(self._model())
+        self.assertEqual(panel["preset_params"], {"resolution": "720p"})
+        self.assertNotIn("resolution", [f["name"] for f in panel["fields"]])
+
+    def test_single_value_is_written_into_the_request_payload(self):
+        args = mock.Mock(param=[], ref_image=[], ref_video=[], ref_audio=[], prompt="x")
+        payload = nm._build_media_payload(args, "sk-x", self._model())
+        self.assertEqual(payload["resolution"], "720p")
+        # 用户显式传的同名参数优先（可覆盖预设）。
+        args2 = mock.Mock(param=[("resolution", "1080p")], ref_image=[], ref_video=[],
+                          ref_audio=[], prompt="x")
+        payload2 = nm._build_media_payload(args2, "sk-x", self._model())
+        self.assertEqual(payload2["resolution"], "1080p")
+
+    def test_single_value_does_not_trip_the_required_check(self):
+        """否则就是死锁：面板里没这个参数，请求前却报缺它。"""
+        args = mock.Mock(param=[("duration", 5)], prompt="x",
+                         ref_image=None, ref_video=None, ref_audio=None)
+        nm._ensure_required_params(self._model(), args)   # 不抛即通过
+        # 反证：拿掉预设（模拟只改面板不改这里）就必须报缺
+        with mock.patch.object(nm, "_preset_params", return_value={}):
+            with self.assertRaises(nm.NoovaError) as ctx:
+                nm._ensure_required_params(self._model(), args)
+        self.assertIn("resolution", str(ctx.exception.message))
+
+    def test_panel_quote_includes_the_preset_params(self):
+        panel = nm.build_param_form(self._model(), chosen_params={"duration": 5})
+        self.assertEqual(panel["credit_estimate"]["credits"], 125.0)
+        self.assertIn("125 积分", panel["credit_estimate_text"])
+
+
+class SurchargeBaseDefaultTest(unittest.TestCase):
+    """Bug A 回归：契约缺 `base` 键时按 0 计，绝不报「取值非法」。"""
+
+    MODELS = (
+        ("Seedance-2.0-mini-720p", 0.0, 25.0),
+        ("fgh-seedance-2.5-720p", 0.0, 120.0),
+        ("Wan3.0-720p", 0.0, 35.0),
+        ("Minimax-H3-768p", 0.0, 7.0),
+    )
+
+    def _model(self, multiplier):
+        return nm._normalize_model({
+            "model": "v", "displayName": "V", "modelType": "video",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
+            "surchargeRules": [{"param": "duration", "match": "present",
+                                "charge": "multiply_by_value",
+                                "multiplier": multiplier}],   # 契约原文无 base 键
+            "params": [{"name": "duration", "type": "number", "required": True,
+                        "min": 4, "max": 30}]})
+
+    def test_missing_base_is_zero_not_an_error(self):
+        for code, base, multiplier in self.MODELS:
+            with self.subTest(code=code):
+                model = self._model(multiplier)
+                cost = nm.compute_credit_cost(model, {"duration": 10})
+                self.assertTrue(cost["exact"])
+                self.assertEqual(cost["credits"], round(base + 10 * multiplier, 2))
+                # 近似价分支（选模型阶段）与精确价分支必须给出同一数量级，不得自相矛盾。
+                approx = nm.approximate_credit(model)
+                self.assertIn(approx["kind"], ("range", "exact"))
+
+    def test_missing_base_quote_matches_the_gateway_formula(self):
+        """网关 `_resolve_param_rule_charge_cost` 的口径：`base + 值 × multiplier`。"""
+        for duration in (4, 5, 10, 15, 30):
+            with self.subTest(duration=duration):
+                cost = nm.compute_credit_cost(self._model(25.0), {"duration": duration})
+                self.assertEqual(cost["credits"], round(0.0 + duration * 25.0, 2))
+
+    def test_explicit_base_is_still_respected(self):
+        model = nm._normalize_model({
+            "model": "v", "displayName": "V", "modelType": "video",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
+            "surchargeRules": [{"param": "duration", "match": "present",
+                                "charge": "multiply_by_value", "multiplier": 2.0,
+                                "base": 10.0}],
+            "params": [{"name": "duration", "type": "number", "required": True,
+                        "min": 1, "max": 30}]})
+        self.assertEqual(nm.compute_credit_cost(model, {"duration": 5})["credits"], 20.0)
+
+    def test_multiplier_missing_still_fails_closed(self):
+        """只有 `multiplier` 缺失才是规则配置非法——这一条不能被 Bug A 的修法放宽。"""
+        model = nm._normalize_model({
+            "model": "v", "displayName": "V", "modelType": "video",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 0.0, "unit": 1},
+            "surchargeRules": [{"param": "duration", "match": "present",
+                                "charge": "multiply_by_value"}],
+            "params": [{"name": "duration", "type": "number", "required": True,
+                        "min": 1, "max": 30}]})
+        with self.assertRaises(nm.NoovaError):
+            nm.compute_credit_cost(model, {"duration": 5})
+
+
+class SurchargeExactMatchTest(unittest.TestCase):
+    """`exact` 规则的取值比较必须与平台同口径（归一化后再比）。
+
+    曾经直接 `str(raw) != str(matchValue)`：契约 `matchValue` 是数字 `5`、用户传
+    `"5.0"` 时，本地判不命中（报价偏低）而网关判命中。
+    """
+
+    def _model(self, match_value):
+        return nm._normalize_model({
+            "model": "opt", "displayName": "Opt", "modelType": "image",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 20.0, "unit": 1},
+            "surchargeRules": [{"param": "imageSize", "match": "exact",
+                                "matchValue": match_value, "charge": "fixed",
+                                "credits": 2.0}],
+            "params": [{"name": "imageSize", "type": "string", "required": True,
+                        "values": ["4K"]}]})
+
+    def test_numeric_equivalents_match(self):
+        """`matchValue=5` 与用户传的 `"5"` / `"5.0"` / `5.0` 必须同等命中（20 + 2）。"""
+        for given in (5, "5", "5.0", 5.0):
+            with self.subTest(given=given):
+                self.assertEqual(
+                    nm.compute_credit_cost(self._model(5), {"imageSize": given})["credits"],
+                    22.0)
+
+    def test_non_equivalent_values_do_not_match(self):
+        self.assertEqual(
+            nm.compute_credit_cost(self._model(5), {"imageSize": "6"})["credits"], 20.0)
+        self.assertEqual(
+            nm.compute_credit_cost(self._model("4K"), {"imageSize": "2K"})["credits"], 20.0)
+
+    def test_synthesized_add_price_rule_is_quoted(self):
+        """后端把选项 `add_price` 合成为 `exact` + `fixed` 规则，本地必须算进去。
+
+        契约实测：`nano-banana-pro` 的 `imageSize=4K` 合成 `credits: 2`；
+        `voice-clone` 的 `instanceType=plus` 合成 `credits: 10`。
+        """
+        model = self._model("4K")
+        self.assertEqual(
+            nm.compute_credit_cost(model, {"imageSize": "4K"})["credits"], 22.0)
+
+
+class QuoteParityTest(unittest.TestCase):
+    """报价对账（生产契约数字）：本地 `compute_credit_cost` 必须与网关逐条一致。
+
+    夹具取自**生产契约的真实形状**（39 个模型 × 全部参数取值组合，实测 399 组零不一致）。
+    网关侧公式见 `../noova-backend/app/services/api_gateway_proxy_service.py` 的
+    `_calculate_cost_decimal` + `_resolve_param_rule_charge_cost`：
+    `总价 = billing_price × billing_unit + Σ 命中规则加收`。
+    """
+
+    FIXTURES = [
+        # (模型, 基础价, 加收规则, 参数组合, 期望积分)
+        ("per_request 底价", 20.0, [], {}, 20.0),
+        ("底价 × 单位", 15.0, [], {}, 15.0),
+        ("按期时长规则", 0.0,
+         [{"param": "duration", "match": "present", "charge": "multiply_by_value",
+           "multiplier": 25.0}], {"duration": 10}, 250.0),
+        ("时长 + 底价", 100.0,
+         [{"param": "duration", "match": "present", "charge": "multiply_by_value",
+           "multiplier": 25.0}], {"duration": 4}, 200.0),
+        ("精确取值固定加收", 20.0,
+         [{"param": "imageSize", "match": "exact", "matchValue": "4K",
+           "charge": "fixed", "credits": 2.0}], {"imageSize": "4K"}, 22.0),
+        ("精确取值不在其中", 20.0,
+         [{"param": "imageSize", "match": "exact", "matchValue": "4K",
+           "charge": "fixed", "credits": 2.0}], {"imageSize": "1K"}, 20.0),
+        ("区间内固定加收", 1.0,
+         [{"param": "duration", "match": "range", "rangeMin": 5, "rangeMax": 10,
+           "charge": "fixed", "credits": 5.0}], {"duration": 7}, 6.0),
+        ("区间外不加收", 1.0,
+         [{"param": "duration", "match": "range", "rangeMin": 5, "rangeMax": 10,
+           "charge": "fixed", "credits": 5.0}], {"duration": 3}, 1.0),
+        ("多参数同时命中", 0.0,
+         [{"param": "duration", "match": "present", "charge": "multiply_by_value",
+           "multiplier": 10.0},
+          {"param": "imageSize", "match": "exact", "matchValue": "4K",
+           "charge": "fixed", "credits": 2.0}],
+         {"duration": 5, "imageSize": "4K"}, 52.0),
+        ("参数没传则规则不参与", 20.0,
+         [{"param": "duration", "match": "present", "charge": "multiply_by_value",
+           "multiplier": 10.0}], {}, 20.0),
+        ("倍率带 base", 0.0,
+         [{"param": "duration", "match": "present", "charge": "multiply_by_value",
+           "multiplier": 2.0, "base": 10.0}], {"duration": 5}, 20.0),
+    ]
+
+    @staticmethod
+    def _model(price, rules):
+        return nm._normalize_model({
+            "model": "parity", "displayName": "Parity", "modelType": "video",
+            "status": "online", "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": price, "unit": 1},
+            "surchargeRules": rules,
+            "params": [{"name": "duration", "type": "number", "required": False,
+                        "min": 4, "max": 30},
+                       {"name": "imageSize", "type": "string", "required": False,
+                        "values": ["1K", "2K", "4K"]}]})
+
+    def test_every_fixture_matches_the_gateway_formula(self):
+        for label, price, rules, params, expected in self.FIXTURES:
+            with self.subTest(label=label):
+                cost = nm.compute_credit_cost(self._model(price, rules), params)
+                self.assertTrue(cost["exact"], label)
+                self.assertEqual(cost["credits"], expected, label)
 
 
 if __name__ == "__main__":

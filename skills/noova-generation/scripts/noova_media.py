@@ -564,6 +564,25 @@ def _require_key(purpose: str = "发起生成请求") -> str:
 _SPEC_CACHE: dict = {}
 
 
+def _align_option_visible_when(raw_rules: object, expected_len: int) -> list:
+    """把契约的 optionVisibleWhen 对齐成与 values **同序等长**的规则数组。
+
+    契约给的平行数组理论上与 values 等长（服务端由同一份 options 生成）。
+    但这是运行时可变的对外数据，**长度不等时不得让下标错位**——错位等于把
+    条件 A 的规则安到取值 B 上，用户按面板选出来的值会被平台 400 拒绝。
+    因此一律以 values 长度为准裁剪/补 None；None 的语义是「无条件的可见」，
+    与后端 _evaluate_visible_when 对空规则的默认放行逐条一致：
+    异常只会**多显示**选项，绝不**少显示**（后者会让面板拿不到任何选项）。
+    """
+    if not isinstance(raw_rules, list):
+        return [None] * expected_len
+    aligned: list = []
+    for index in range(expected_len):
+        rule = raw_rules[index] if index < len(raw_rules) else None
+        aligned.append(rule if isinstance(rule, dict) else None)
+    return aligned
+
+
 def _normalize_model(item: dict) -> dict:
     """把对外契约里的一条模型记录转成内部字典（键名固定，供全模块消费）。
 
@@ -585,14 +604,23 @@ def _normalize_model(item: dict) -> dict:
         if not name:
             continue
         labels_raw = raw.get("valueLabels") if isinstance(raw.get("valueLabels"), dict) else {}
+        values = [str(v).strip() for v in (raw.get("values") or []) if str(v).strip()]
         param: dict = {
             "name": name,
             "type": str(raw.get("type") or "string").strip(),
             "required": bool(raw.get("required")),
             "label": str(raw.get("label") or "").strip(),
-            "values": [str(v).strip() for v in (raw.get("values") or []) if str(v).strip()],
+            "values": values,
             "value_labels": {str(k).strip(): str(v).strip()
                              for k, v in labels_raw.items() if str(k).strip()},
+            # 字段级条件可见（契约 `visibleWhen`）：契约没给就是 None（始终可见）。
+            "visible_when": raw.get("visibleWhen") if isinstance(raw.get("visibleWhen"), dict) else None,
+            # 选项级条件可见（契约 `optionVisibleWhen`）：与 `values` **同序等长**。
+            # **必须按 `values` 长度对齐并补 None**——契约异常（长度不等）时，
+            # 错位会把规则配到别的取值上；补 None 的语义是「无条件的可见」
+            # （与后端「无规则即可见」一致），错位只会多显示、不会少显示。
+            "option_visible_when": _align_option_visible_when(
+                raw.get("optionVisibleWhen"), len(values)),
         }
         for key in ("min", "max", "minItems", "maxItems"):
             if raw.get(key) is not None:
@@ -602,16 +630,14 @@ def _normalize_model(item: dict) -> dict:
     return {
         "code": code,
         "display_name": str(item.get("displayName") or "").strip() or code,
-        # 线路：同一模型的多个接入通道，每个线路各自是一条独立的 `model` 编码。
-        # 旧后端没有这个字段 → 空串，展示层退回「默认」，**不 fail-closed**：
-        # 线路只影响展示与选择，不影响报价正确性。
-        "line": str(item.get("line") or "").strip(),
         "model_type": str(item.get("modelType") or "").strip().lower(),
         "status": str(item.get("status") or "").strip().lower(),
         "protocols": protocols,
         "billing": billing,
         "surcharge_rules": [r for r in (item.get("surchargeRules") or [])
                             if isinstance(r, dict)],
+        # 服务端算好的「默认组合」报价（contract pricing 块）；旧后端无此字段时为 None。
+        "pricing": item.get("pricing") if isinstance(item.get("pricing"), dict) else None,
         "params": params,
     }
 
@@ -715,16 +741,13 @@ def select_chat_protocol(model: dict, requested: str) -> tuple[str, str]:
 # 模型发现
 # ---------------------------------------------------------------------------
 
-def line_label(model: dict) -> str:
-    """线路的展示名：契约给了就用它，没给（旧后端或运营未填）就是「默认」。
-
-    与前端 `normalizeLineLabel` 同口径（`components/Canvas/Utils/modelLineSelection.ts`），
-    保证同一份数据在网站与 skill 里显示一致。
-    """
-    return str(model.get("line") or "").strip() or "默认"
-
 def model_family_key(model: dict) -> str:
-    """同族判定键：同一类型下的同一显示名即同一模型的多个线路。
+    """同族判定键：同一类型下的同一显示名。
+
+    生产确实存在**同名不同编码**的模型（同一展示名对应多条编码）。它们不是
+    「同一模型的线路」，而是各自独立的模型编码；聚族只为一件事——**同名时
+    提醒用户用模型编码区分**（面板的 `duplicate_names` / `duplicate_note`），
+    不参与选择，也不参与计价。
 
     与前端 `getModelFamilyKey` 同口径（`${类型}:${族名}`）。
     """
@@ -732,15 +755,14 @@ def model_family_key(model: dict) -> str:
                       str(model.get("display_name") or "").strip())
 
 def build_model_families(models: list[dict]) -> list[dict]:
-    """按「类型 + 显示名」把模型聚成族，族内即该模型的全部线路。
+    """按「类型 + 显示名」把模型聚成族。
 
-    为什么要聚：生产真实存在同名多线路（同一展示名对应多条编码），
-    平铺清单里它们混在一起，用户看不出「这是同一个模型的几条线路」。
-
-    族内按线路标签稳定排序（同标签时按编码兜底），保证多次运行顺序一致。
+    之所以还要聚：同名模型平铺在清单里就是一串看起来重复的行，用户看不出
+    「这是同一个名字下的多个独立模型」。族内按**模型编码**稳定排序，
+    保证多次运行顺序一致（编码是唯一稳定且可区分的键）。
 
     兼容两种输入形状：契约模型（有 `model_type`/`display_name`）与模型面板 option
-    （有 `family`/`label`，是同一份数据的投影）。
+    （有 `family`/`label`/`value`，是同一份数据的投影）。
     """
     families: dict = {}
     for model in models:
@@ -757,9 +779,7 @@ def build_model_families(models: list[dict]) -> list[dict]:
             }
         family["lines"].append(model)
     for family in families.values():
-        family["lines"].sort(key=lambda m: (
-            str(m.get("line_label") or line_label(m)),
-            str(m.get("code") or m.get("value") or "")))
+        family["lines"].sort(key=lambda m: str(m.get("code") or m.get("value") or ""))
 
     def _order(family: dict) -> tuple:
         mtype = family["model_type"]
@@ -827,7 +847,7 @@ def _rule_credit_bounds(rule: dict, model: dict) -> tuple | None:
             "%s 加收 %s 积分" % (name, _fmt_num(credits)))
 
 def approximate_credit(model: dict) -> dict:
-    """**选线路时**的近似消耗（此时用户还没定参数，故只能是区间或定性）。
+    """**选模型时**的近似消耗（此时用户还没定参数，故只能是区间或定性）。
 
     与 `compute_credit_cost`（参数定好后的精确报价）的分工：
 
@@ -894,10 +914,13 @@ def _select_by_code(models: list[dict], code: str) -> dict | None:
     没有编码的模型（平台 `model_code` 为空）永远选不中——它无法被调用，
     由调用方在清单里标为不可用，而不是在这里猜一个编码出来。
 
-    **显示名命中多条时 fail-closed**：生产真实存在同名多线路
-    （同一展示名对应多条编码），旧实现静默取第一条，
-    等于用户指定了名字却拿到一条随机线路、且毫不知情。这里改为报错并列出
-    候选（编码 + 线路 + 计价），把选择权交回用户。
+    **显示名命中多条时 fail-closed**：生产真实存在同名不同编码的模型
+    （同一展示名对应多条编码），旧实现静默取第一条，等于用户指定了名字却
+    拿到一个随机模型、且毫不知情。这里改为报错并列出候选（**编码 + 计价**），
+    把选择权交回用户。
+
+    候选里只有编码与计价：编码是唯一可靠且可区分的选择键，计价让用户看出
+    同名几条的价差；对外契约已不再下发线路标签，也不该在这里补一个近似的。
     """
     target = str(code or "").strip().lower()
     if not target:
@@ -911,9 +934,9 @@ def _select_by_code(models: list[dict], code: str) -> dict | None:
         return matches[0]
     if len(matches) > 1:
         candidates = "；".join(
-            "%s（%s，%s）" % (m["code"], line_label(m), _price_cell(m)) for m in matches)
+            "%s（%s）" % (m["code"], _price_cell(m)) for m in matches)
         raise NoovaError(
-            "「%s」有 %d 条线路，无法确定用哪一条" % (code, len(matches)),
+            "「%s」命中 %d 个同名模型，无法确定用哪一个" % (code, len(matches)),
             hint="请改用模型编码指定。候选：" + candidates,
         )
     return None
@@ -1190,6 +1213,52 @@ def collect_result_urls(payload: object) -> list[str]:
 
     _scan(payload, 0)
     return urls
+
+
+def fetch_pricing(model: dict, params: dict | None = None, *, timeout: int = 20) -> dict | None:
+    """向服务端询价（`GET /api/models/params`）：**权威价由服务端算**，本工具不自行计价。
+
+    返回服务端的 `pricing` 块（`{exact, credits, yuan, quotedParams, note}`）；
+    任何失败（网络 / 鉴权 / 旧后端无 pricing）都返回 None，
+    由调用方回退到本地按契约的**预估**并明确标注「预估」（计划 §4.5）。
+    """
+    code = str(model.get("code") or "").strip()
+    if not code:
+        return None
+    path = MODEL_PARAMS_PATH + "?model=" + urllib.parse.quote(code)
+    if params:
+        payload_json = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+        path += "&params=" + urllib.parse.quote(payload_json)
+    try:
+        key = _require_key("查询模型价格")
+        response = _request("GET", path, key=key, timeout=timeout, max_retries=0)
+    except NoovaError:
+        return None
+    data = response.get("data") if isinstance(response, dict) else None
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list) or not models:
+        return None
+    first = models[0]
+    pricing = first.get("pricing") if isinstance(first, dict) else None
+    return pricing if isinstance(pricing, dict) else None
+
+
+def _authoritative_credits(pricing: object) -> tuple[float, bool] | None:
+    """从服务端 `pricing` 块取 (积分数, 是否确定值)；给不出确定值返回 None。"""
+    if not isinstance(pricing, dict):
+        return None
+    value = pricing.get("credits")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return (float(value), bool(pricing.get("exact")))
+
+
+def _pricing_note(pricing: object) -> str:
+    if isinstance(pricing, dict):
+        note = str(pricing.get("note") or "").strip()
+        if note:
+            return note
+    return "参数决定价格"
 
 
 def fetch_credit(key: str, *, timeout: int = 20) -> dict | None:
@@ -1717,7 +1786,11 @@ def _match_surcharge_charge(rule: dict, params: dict) -> float | None:
         return parsed if math.isfinite(parsed) else None
 
     if match == "exact":
-        if str(raw).strip() != str(rule.get("matchValue") or "").strip():
+        # 取值比较走 `_normalize_option_key`：与平台侧 `_normalize_option_key`
+        # 同一口径（`4K` vs `4k` 之外还覆盖 `5.0 == 5`、布尔 `true`/`True`）。
+        # 曾经直接比较字符串，导致 `contracted value 为数字 5、用户传 "5.0"`
+        # 时本地判不命中而网关判命中（报价偏低）。
+        if _normalize_option_key(raw) != _normalize_option_key(rule.get("matchValue")):
             return None
     elif match == "range":
         actual = _number(raw)
@@ -1732,8 +1805,15 @@ def _match_surcharge_charge(rule: dict, params: dict) -> float | None:
     if charge == "multiply_by_value":
         actual = _number(raw)
         multiplier = _number(rule.get("multiplier"))
-        base = _number(rule.get("base"))
-        if actual is None or multiplier is None or base is None:
+        # 契约**没有 `base` 键**时按 0 计：后端投影只在 base 非 0 时输出该键
+        # （`api_gateway_model_service._project_surcharge_rules`），实际结算读的是
+        # DB 规则里的 `charge_base`（生产为 `"0.00"`）。本文件的近似价
+        # `_rule_credit_bounds` 与网关 `_resolve_param_rule_charge_cost` 都按 0 处理；
+        # 精确价分支若把「缺 base」当成「取值非法」，就会对同一份契约报出自相矛盾的
+        # 结论——线上 4 个时长加收模型的精确报价因此**直接崩溃**（exit 1）。
+        # 只有 `multiplier` 缺失才是真正的规则配置非法，仍旧 fail-closed。
+        base = _number(rule.get("base")) or 0.0
+        if actual is None or multiplier is None:
             raise NoovaError(
                 f"参数「{name}」参与计费，但取值无法解析为数值：{raw!r}",
                 hint=f"请给一个数值，例如 --param {name}=5",
@@ -1819,14 +1899,35 @@ def compute_credit_cost(model: dict, params: dict | None = None) -> dict:
     }
 
 
-def credit_estimate_text(model: dict, params: dict | None = None) -> str:
-    """一句话报价（用户确认生成前必须看到）。"""
-    estimate = compute_credit_cost(model, params)
+def credit_estimate_text(
+    model: dict, params: dict | None = None, *, pricing: dict | None = None
+) -> str:
+    """一句话报价（用户确认生成前必须看到）。
+
+    **口径优先级（计划 §4.5）**：
+    1. 服务端权威价（${Q}pricing.credits${Q}，由服务端真实结算函数算出）→ 直接照抄上屏，
+       调用方**不再自己算**；
+    2. 服务端明确给不出确定值（${Q}credits=null${Q}）→ 如实说明原因，不编数字；
+    3. 旧后端没有 ${Q}pricing${Q} 块 → 回退本地按契约的**预估**，文案必须带「预估」字样。
+
+    唯一可核对的真值始终是生成结束后的「本次扣减（账户余额差值）」。
+    """
     ratio = _credits_per_yuan()
     rule = f"{_fmt_num(ratio)} 积分 = 1 元"
+    resolved = pricing if isinstance(pricing, dict) else model.get("pricing")
+    if isinstance(resolved, dict) and "credits" in resolved:
+        # 服务端已作答：给得出确定值就照抄，给不出就如实说明（绝不回退本地猜一个数）。
+        authoritative = _authoritative_credits(resolved)
+        credits, exact = authoritative if authoritative is not None else (None, False)
+        if credits is not None and exact:
+            return (f"服务端权威价：{_fmt_num(credits)} 积分"
+                    f"（≈ {_fmt_num(round(credits / ratio, 4)) if ratio else None} 元；{rule}）")
+        return f"服务端未给出确定金额（{_pricing_note(resolved)}）；换算：{rule}"
+    estimate = compute_credit_cost(model, params)
     if estimate["exact"]:
-        return (f"预计消耗 {_fmt_num(estimate['credits'])} 积分"
-                f"（≈ {_fmt_num(estimate['yuan'])} 元；{rule}）")
+        return (f"按契约预估：{_fmt_num(estimate['credits'])} 积分"
+                f"（≈ {_fmt_num(estimate['yuan'])} 元；{rule}；"
+                f"真实扣费以服务端结算为准）")
     return f"按实际用量结算（{estimate['note']}）；换算：{rule}"
 
 
@@ -1947,12 +2048,8 @@ def cmd_models(args) -> int:
                 "callable": bool(m["code"]) and m["status"] == CALLABLE_MODEL_STATUS,
                 "display_name": m["display_name"],
                 "model_type": m["model_type"],
-                # 线路 = 同一模型的一条接入通道，各自是独立编码。
-                # `line` 原样透出（运营手填，可能过期），`line_label` 是展示名。
-                # **绝不可用 `line` 里的数字计价**（已实测它与真实单价会漂移），
-                # 真源只有 `billing` + `surcharge_rules`。
-                "line": m["line"],
-                "line_label": line_label(m),
+                # `family` 只用于「同名模型」的提示分组（键 = 类型:显示名）；
+                # 选择与计价一律按 `model_code`——它才是请求里要传的值。
                 "family": model_family_key(m),
                 "approximate_credit": approximate_credit(m),
                 "status": m["status"],
@@ -2000,11 +2097,13 @@ def cmd_models(args) -> int:
 
         print()
         print(f"  {header}")
-        # 按族遍历：同一模型的多个线路挨着显示，用户才看得出「这是同一个模型的
-        # 几条线路」，而不是一串看起来重名的模型。线路**不加列**——实测加一列
-        # 视频组撑到 96 列、文本组 113 列，80 列终端整表折行；
-        # 改成该行下方一条约 40 列的子行。
+        # 按族遍历：同名模型挨着显示，用户才看得出「这是同一个名字下的几个
+        # 独立模型（编码不同）」。族标题只在真的同名（族内 >1）时打印——
+        # 实测给每个模型都套一个族标题会把清单撑得又长又吵。
         for family in build_model_families(group):
+            if len(family["lines"]) > 1:
+                print(f"  ▸ {_safe(family['label'])}（同名 {len(family['lines'])} 个，"
+                      f"按编码区分）")
             for model in family["lines"]:
                 code_cell = model["code"] or "（无编码，不可调用）"
                 print(f"  {_pad(code_cell, w_code)}  {_pad(model['display_name'], w_name)}  "
@@ -2012,14 +2111,6 @@ def cmd_models(args) -> int:
                       f"{_pad(_status_label(model['status']), w_state)}  {_price_cell(model)}")
                 for text in billing_spec(model)["surcharge_text"]:
                     print(f"    ↳ 加收：{text}")
-                if model["line"] or len(family["lines"]) > 1:
-                    # 只有能给出数字时才把消耗附在线路后面：`usage` 型的文案
-                    # （`按量计费（按 token 用量结算）`／`按用量计价（见加收规则）`）
-                    # 与同一行的「计价」列、上方「加收」行完全重复，只会让表变吵。
-                    estimate = approximate_credit(model)
-                    cost = ("" if estimate["kind"] == "usage"
-                            else " ・ " + _safe(_estimate_text(estimate)))
-                    print(f"    ↳ 线路：{_safe(line_label(model))}{cost}")
 
     if args.type in (None, "audio") and not by_type.get("audio"):
         print()
@@ -2034,25 +2125,21 @@ def cmd_models(args) -> int:
 def model_contract(model: dict, models: list[dict] | None = None) -> dict:
     """模型的对外契约视图（`cmd_model` 与 `cmd_params` 共用同一份，避免口径漂移）。
 
-    `models` 给全量清单时额外带出**同族其它线路**——用户看到一条线路后最常问的
-    就是「还有别的线路吗、差在哪」，不给就只能再跑一次 `models` 自己找。
+    `models` 给全量清单时额外带出**同名其它编码**——用户看到一条后最常问的
+    就是「还有别的吗、差在哪」，不给就只能再跑一次 `models` 自己找。
     """
     protocols = model_protocols(model)
     family_key = model_family_key(model)
     siblings = [m for m in (models or []) if m["code"] and m["code"] != model["code"]
                 and model_family_key(m) == family_key]
-    siblings.sort(key=lambda m: (line_label(m), m["code"]))
+    siblings.sort(key=lambda m: m["code"])
     return {
         "model_code": model["code"],
         "callable": bool(model["code"]),
         "display_name": model["display_name"],
-        "line": model["line"],
-        "line_label": line_label(model),
         "family": family_key,
         "siblings": [{
             "model_code": m["code"],
-            "line": m["line"],
-            "line_label": line_label(m),
             "price_cell": _price_cell(m),
             "billing_text": _price_text(m),
             "approximate_credit": approximate_credit(m),
@@ -2083,8 +2170,6 @@ def _print_param_table(params: list[dict]) -> None:
 def _print_contract(spec: dict, model: dict) -> None:
     """契约的人读渲染（`cmd_model` 与 `cmd_params` 共用）。"""
     print(f"模型　：{spec['display_name']}（{spec['model_code']}）")
-    print(f"线路　：{_safe(spec['line_label'])}"
-          f"　（换线路＝换用该线路的模型编码）")
     print(f"类型　：{TYPE_LABELS.get(spec['model_type'], spec['model_type'])}"
           f"　　状态：{_status_label(spec['status'])}")
     if not spec["callable"]:
@@ -2103,7 +2188,7 @@ def _print_contract(spec: dict, model: dict) -> None:
     print(f"换算　：{_fmt_num(ratio)} 积分 = 1 元"
           f"（即 1 积分 ≈ {_fmt_num(round(1 / ratio, 4))} 元）")
     print(f"近似消耗：{_safe(_estimate_text(spec['approximate_credit']))}")
-    print("　（选线路阶段的近似值；参数定好后会再报一次精确价）")
+    print("　（选模型阶段的近似值；参数定好后会再报一次精确价）")
     if spec["params"]:
         print(f"\n参数（{len(spec['params'])} 个，名称与取值必须原样使用）：")
         _print_param_table(spec["params"])
@@ -2111,17 +2196,13 @@ def _print_contract(spec: dict, model: dict) -> None:
         print("\n（该模型没有参数契约条目，只能传提示词）")
     siblings = spec.get("siblings") or []
     if siblings:
-        # 近似消耗另起一行：并排放会把「线路」列撑到 20 列宽，实测整行 88 列、
-        # 80 列终端折行；拆开后主行最多 66 列。
-        print(f"\n同模型其它线路（{len(siblings)} 条，换线路请换用其模型编码）：")
+        print(f"\n同名其它模型（{len(siblings)} 个，编码不同、计价可能不同）：")
         w_code = min(max(_display_width(m["model_code"]) for m in siblings), 26)
-        w_line = min(max(_display_width(m["line_label"]) for m in siblings), 20)
-        print(f"  {_pad('编码', w_code)}  {_pad('线路', w_line)}  计价")
+        print(f"  {_pad('编码', w_code)}  计价")
         for m in siblings:
-            print(f"  {_pad(m['model_code'], w_code)}  {_pad(_safe(m['line_label']), w_line)}  "
-                  f"{_safe(m['price_cell'])}")
+            print(f"  {_pad(m['model_code'], w_code)}  {_safe(m['price_cell'])}")
             estimate = _estimate_text(m["approximate_credit"])
-            # 固定单价线路的近似消耗与「计价」列完全同文，重复一行是噪声；
+            # 固定单价的近似消耗与「计价」列完全同文，重复一行是噪声；
             # 只有区间/定性形态（如 `约 240~900 积分/次`）才额外给出。
             if estimate and estimate != m["price_cell"]:
                 print(f"    ↳ {_safe(estimate)}")
@@ -2280,15 +2361,69 @@ def _field_cli(model_type: str, name: str, ref_reverse: dict) -> str:
     return f"--param {name}"
 
 
-def _param_field(param: dict, model_type: str, ref_reverse: dict) -> dict:
+def _option_rule_key(rule: object) -> tuple | None:
+    """把一条选项可见规则归一成可比较的 `(when, operator, value)`；无效规则给 None。
+
+    与后端 `_normalize_visible_when` 同一口径：`when` 为空即「无依赖」（不是
+    「依赖空参数名」），`filled` / `empty` 两个操作符不比较取值。
+    """
+    if not isinstance(rule, dict):
+        return None
+    # 兼容两种写法：契约投影本身用 `when`（后端 `visible_when` 的字段名），
+    # 面板分组里我们把被依赖参数改叫 `param`（更贴近「依赖哪个参数」的读法）。
+    when = str(rule.get("when") or rule.get("param") or "").strip()
+    if not when:
+        return None
+    operator = str(rule.get("operator") or "eq").strip().lower() or "eq"
+    if operator in ("filled", "empty"):
+        return (when, operator, None)
+    return (when, operator, rule.get("value"))
+
+
+def _option_rule_matches(rule: dict, params: dict) -> bool:
+    """当前已知参数下，这条选项规则是否命中（语义与后端 `_evaluate_visible_when` 对齐）。
+
+    只做**只读判断**：控制器参数未提供时返回 `False`（不是「不可见」，而是
+    「无法判断」——调用方据此退回「按组列出、不阻拦」的渲染，见 SKILL.md）。
+    """
+    key = _option_rule_key(rule)
+    if key is None:
+        return False
+    when, operator, expected = key
+    target = None
+    for name, value in (params or {}).items():
+        if str(name).strip().lower() == when.lower():
+            target = value
+            break
+    else:
+        # 控制器不在本次已知参数里：无法判断（含 filled/empty 也不猜）。
+        return False
+    filled = not (target is None or (isinstance(target, str) and not target.strip())
+                  or (isinstance(target, list) and not target))
+    if operator == "filled":
+        return filled
+    if operator == "empty":
+        return not filled
+    same = _normalize_option_key(target) == _normalize_option_key(expected)
+    return not same if operator == "ne" else same
+
+
+def _param_field(param: dict, model_type: str, ref_reverse: dict,
+                 *, known_params: dict | None = None) -> dict:
     """把一个契约参数转成面板字段（`kind`：能不能选、单选还是只能看）。
 
     取值形态**只由契约决定**：
-      - `values` 恰好 1 个 → `fixed`（唯一取值，用户无从选择，但必须让他知道）；
+      - `values` 恰好 1 个 → `fixed`（唯一取值，用户无从选择，但必须知道）；
       - `values` ≥ 2 个     → `choice`；
       - 数值类型           → `number`（范围取契约 `min`/`max`）；
       - 数组类型           → `list`（数量上限取 `maxItems`）；
       - 其余               → `text`。
+
+    多取值字段若契约给了 `optionVisibleWhen`（与 `values` 同序的条件数组），额外
+    输出 `depends_on` / `option_groups`：把「一次平铺几十项」拆成「按控制器取值
+    分组的几段」，并给出当前已知取值下命中的那一组（`active_group`）。
+    `known_params`（单值预设 + 用户已定参数）仅用于算 `active_group`，**不裁剪**
+    `options` / `option_groups`——哪些真的可见由用户当前选择决定，面板要能重算。
     """
     name = str(param.get("name") or "").strip()
     type_text = str(param.get("type") or "string").strip()
@@ -2328,7 +2463,41 @@ def _param_field(param: dict, model_type: str, ref_reverse: dict) -> dict:
                      "（本地文件会自动上传）" if limit is not None else
                      "可传多个：公网 URL 或本地文件路径（本地文件会自动上传）")
 
-    return {
+    # 条件可见性：契约的 `optionVisibleWhen` 与 `values` 同序（`_align_option_visible_when`
+    # 已按 values 长度对齐）。有规则的合并成「按控制器取值分组」，无规则的另立一组
+    # （**始终可见**，与后端「无 visible_when 即放行」逐条一致）。
+    rules = list(param.get("option_visible_when") or [])
+    rule_keys = [_option_rule_key(r) for r in rules]
+    depends_on: str | None = None
+    option_groups: list[dict] = []
+    active_group: int | None = None
+    if any(key is not None for key in rule_keys):
+        for key in rule_keys:
+            if key is not None:
+                depends_on = key[0]
+                break
+        buckets: dict = {}
+        for value, key in zip(options, rule_keys):
+            bucket = buckets.get(key)
+            if bucket is None:
+                bucket = buckets[key] = {
+                    "when": (None if key is None else
+                             {"param": key[0], "operator": key[1], "value": key[2]}),
+                    "always": key is None,
+                    "options": [],
+                }
+                option_groups.append(bucket)
+            bucket["options"].append({"value": value,
+                                      "label": str(labels.get(value) or value)})
+        # 命中的分组（仅对有规则的组求值；无规则组恒可见，不参与「命中」判定）。
+        for index, bucket in enumerate(option_groups):
+            if bucket["always"]:
+                continue
+            if _option_rule_matches(bucket["when"], known_params or {}):
+                active_group = index
+                break
+
+    field = {
         "name": name,
         "label": label,
         "type": type_text,
@@ -2343,6 +2512,71 @@ def _param_field(param: dict, model_type: str, ref_reverse: dict) -> dict:
         "cli": _field_cli(model_type, name, ref_reverse),
         "note": "；".join(notes),
     }
+    if depends_on is not None:
+        field["depends_on"] = depends_on
+        field["option_groups"] = option_groups
+        field["active_group"] = active_group
+    # 字段级条件可见（契约 `visibleWhen`）：当前生产 0 命中，属同族漏投影的预防性
+    # 补齐。这里**只透出、不过滤**——面板少显示一个必填字段的代价远大于多显示一个
+    # 不适用的字段（后者用户看得见、也不会发错请求）。
+    visible_when = param.get("visible_when")
+    if isinstance(visible_when, dict):
+        field["visible_when"] = visible_when
+        operator = str(visible_when.get("operator") or "eq").strip().lower()
+        if operator == "filled":
+            field["visible_note"] = "仅当「%s」已填写时适用" % visible_when.get("when")
+        elif operator == "empty":
+            field["visible_note"] = "仅当「%s」未填写时适用" % visible_when.get("when")
+        else:
+            field["visible_note"] = "仅当「%s」= %s 时适用" % (
+                visible_when.get("when"), visible_when.get("value"))
+    return field
+
+
+def _topological_order(fields: list[dict]) -> list[dict]:
+    """把字段排成「控制器在依赖项之前」的拓扑序，同级内保持「必填在前」稳定排序。
+
+    必要性（生产实证）：`gpt-image-2-stable` 的 `imageSize`（控制器）是 `optional`、
+    `aspect_ratio`（依赖项）是 `required`，只按「必填优先」排会把控制器排到依赖项之后，
+    用户先撞上 14/40 项的平铺列表，再回头发现「原来先选分辨率能收窄」。
+
+    防御：`depends_on` 指向不存在的字段、或形成环（契约由运营配置，理论上不该出现）
+    → **退回原「必填优先」顺序**，绝不为了排序卡死或丢字段。
+    """
+    index_of = {str(f.get("name") or ""): i for i, f in enumerate(fields)}
+    # 依赖边：depends_on 指向的字段必须排在前面。控制器不在本次字段里
+    # （单值预设已自动采用）时无需求序，也不会成环。
+    edges: dict[str, list[str]] = {}
+    indegree = {str(f.get("name") or ""): 0 for f in fields}
+    for f in fields:
+        name = str(f.get("name") or "")
+        dep = f.get("depends_on")
+        if not dep or dep not in index_of or dep == name:
+            continue
+        edges.setdefault(dep, []).append(name)
+        indegree[name] += 1
+
+    # 稳定排序的初始序：必填在前，同级保持契约内相对顺序。
+    ordered_names = [str(f.get("name") or "") for f in
+                     sorted(fields, key=lambda f: 0 if f["required"] else 1)]
+    position = {name: i for i, name in enumerate(ordered_names)}
+
+    ready = sorted([n for n in ordered_names if indegree[n] == 0], key=lambda n: position[n])
+    result: list[str] = []
+    remaining = dict(indegree)
+    while ready:
+        name = ready.pop(0)
+        result.append(name)
+        for child in edges.get(name, []):
+            remaining[child] -= 1
+            if remaining[child] == 0:
+                ready.append(child)
+                ready.sort(key=lambda n: position[n])
+    if len(result) != len(ordered_names):
+        # 有环（或自环被跳过）：契约异常，退回原顺序而不是丢字段。
+        return sorted(fields, key=lambda f: 0 if f["required"] else 1)
+    by_name = {str(f.get("name") or ""): f for f in fields}
+    return [by_name[name] for name in result]
 
 
 def build_param_form(model: dict, *, model_type: str | None = None,
@@ -2351,12 +2585,22 @@ def build_param_form(model: dict, *, model_type: str | None = None,
 
     `chosen_params`（用户已经定下的参数）非空时，面板额外给出**本次预计消耗积分**——
     这是「用户确认前必须看到价钱」的落点（`form --code X --param k=v`）。
+
+    **单值参数不进面板**：`values` 恰好 1 个的参数用户无从选择，仍按 `fixed` 展示
+    只会占位。它们改为进 `preset_params`（已自动采用），但仍然**参与可见性求值**
+    ——生产 4 个图像模型的 `aspect_ratio` 选项条件依赖的正是单值的 `imageSize`，
+    不带入求值就会得到「没有任何可见选项」的空面板。
     """
     mtype = model_type or model["model_type"]
     ref_reverse = {str(v).strip().lower(): k
                    for k, v in _reference_field_map(model, quiet=True).items()}
     code_tokens = {str(model.get("code") or "").strip().lower(), "model"}
 
+    # 用户已定参数（命令行给的）与单值预设共同构成「当前已知取值」，
+    # 用于算每个分组字段的 `active_group`。
+    known_params: dict = dict(chosen_params or {})
+    preset_params: dict = {}
+    visible_params: list[dict] = []
     fields: list[dict] = []
     hidden: list[str] = []
     for param in model.get("params") or []:
@@ -2368,9 +2612,17 @@ def build_param_form(model: dict, *, model_type: str | None = None,
         if name.lower() in code_tokens:
             hidden.append(name)
             continue
-        fields.append(_param_field(param, mtype, ref_reverse))
-    # 必填在前（稳定排序，保持契约内的相对顺序）：面板先问关键字段。
-    fields.sort(key=lambda f: 0 if f["required"] else 1)
+        values = [str(v).strip() for v in (param.get("values") or []) if str(v).strip()]
+        if len(values) == 1:
+            # 单值参数：不进面板，但必须带入求值（见 docstring）。
+            preset_params[name] = values[0]
+            known_params.setdefault(name, values[0])
+            continue
+        visible_params.append(param)
+    for param in visible_params:
+        fields.append(_param_field(param, mtype, ref_reverse, known_params=known_params))
+    # 拓扑序（控制器先于依赖项），同级内「必填在前」；异常时退回必填优先。
+    fields = _topological_order(fields)
 
     payload: dict = {
         "panel": "param_panel",
@@ -2389,15 +2641,32 @@ def build_param_form(model: dict, *, model_type: str | None = None,
         "eta": _eta_text(mtype),
         "fields": fields,
         "hidden_fields": hidden,
+        # 单值参数（`values` 恰好 1 个）：不进选择面板，已自动采用。
+        # 载体是这里 + `_build_media_payload` + `_ensure_required_params` 三处，
+        # 缺任何一处都会变成「面板里没这个参数、请求前却报缺它」。
+        "preset_params": preset_params,
         "contract_available": bool(model.get("params")),
         "confirm_hint": FORM_CONFIRM_HINT,
         "next_step": FORM_CONFIRM_HINT,
     }
+    if preset_params:
+        adopted = "、".join("%s=%s" % (k, v) for k, v in preset_params.items())
+        payload["preset_note"] = ("单值参数：" + adopted
+                                  + "（该参数当前只有这一个取值，无需选择）")
     if chosen_params:
-        estimate = compute_credit_cost(model, chosen_params)
+        # 报价按**含单值预设**的完整参数算：少传一个单价相关参数会低估费用。
+        estimate_params = {**preset_params, **chosen_params}
+        # 权威价优先：服务端用真实结算函数算（服务端出数，调用方不自算）。
+        # 拿不到（旧后端/网络失败）时回退本地预估，文案由 credit_estimate_text 标注「预估」。
+        authoritative = fetch_pricing(model, estimate_params)
+        estimate = compute_credit_cost(model, estimate_params)
         payload["chosen_params"] = chosen_params
         payload["credit_estimate"] = estimate
-        payload["credit_estimate_text"] = credit_estimate_text(model, chosen_params)
+        if authoritative is not None:
+            payload["credit_authoritative"] = authoritative
+        payload["credit_estimate_text"] = credit_estimate_text(
+            model, estimate_params, pricing=authoritative
+        )
     if not fields:
         payload["empty_note"] = ("该模型未提供参数契约条目；只有提示词可填。"
                                  "契约缺失时不要臆造参数名或取值。")
@@ -2434,8 +2703,7 @@ def build_model_form(model_type: str, models: list[dict]) -> dict:
             # 让用户知道该模型存在、当前不可调用。
             unavailable.append({
                 "display_name": model["display_name"],
-                "line": model["line"],
-                "line_label": line_label(model),
+                "model_code": model["code"],
                 "status": _status_label(model["status"]),
                 "reason": f"当前状态：{_status_label(model['status'])}（暂不可调用）",
             })
@@ -2443,12 +2711,10 @@ def build_model_form(model_type: str, models: list[dict]) -> dict:
         options.append({
             "value": model["code"],
             "label": model["display_name"],
-            "line": model["line"],
-            "line_label": line_label(model),
             "family": model_family_key(model),
             "status": _status_label(model["status"]),
             "billing": _price_text(model),
-            # 选线路阶段的近似消耗（参数还没定，所以是区间或定性）。
+            # 选模型阶段的近似消耗（参数还没定，所以是区间或定性）。
             # `credit_estimate` 是**不带依据**的短文案（面板一行放得下，实测带
             # 依据会到 88 列）；`credit_estimate_detail` 是依据（如
             # `duration 4~30 × 80 积分`），供需要解释数字来源的调用方使用。
@@ -2470,21 +2736,15 @@ def build_model_form(model_type: str, models: list[dict]) -> dict:
         "billing_legend": _price_legend(model_type),
         "options": options,
         "unavailable": unavailable,
-        "next_step": ("选完「模型 + 线路」后，面板列出该模型的全部参数，"
+        "next_step": ("选完模型后，面板列出该模型的全部参数，"
                       "并在确认前给出精确消耗积分"),
     }
-    if len(options) > 1 and len({o["family"] for o in options}) < len(options):
-        # 面板里出现多条线路时先把口径讲清楚：线路是同一模型的接入通道，
-        # 各自是独立编码，**必须让用户明确选一条**再进参数。
-        payload["line_legend"] = "同一模型的多条线路计价不同，请让用户明确选一条"
     if duplicated:
-        # 实测同名模型确实存在（同一展示名对应多条编码）。
-        # 契约里的 `line` 只说明"是哪条线路"，**不保证唯一、也不可用于计价**
-        # （同一 `line` 文本会在不同模型上复现，且数字后缀会与真实单价漂移）。
-        # 唯一可靠的选择键是**模型编码**——必须把线路、编码、计价三者一起摆出来。
+        # 实测同名模型确实存在（同一展示名对应多条编码，是**不同的模型**，
+        # 请求时 `model` 传的值不同）。唯一可靠的选择键是**模型编码**，
+        # 因此把「编码 + 计价」一起摆出来让用户选，不引入任何模糊的展示名。
         payload["duplicate_names"] = duplicated
-        # 长度受 80 列约束：中文按 2 列算，加「注意：」前缀后整行必须 ≤80 列。
-        payload["duplicate_note"] = "存在同名模型（多线路），按「线路 + 模型编码 + 计价」让用户选一条"
+        payload["duplicate_note"] = "存在同名模型（编码不同），按「模型编码 + 计价」让用户选一个"
     if not options:
         payload["empty_note"] = (f"当前没有可用的{TYPE_LABELS.get(model_type, model_type)}模型"
                                  "（以平台实时清单为准，稍后重试）")
@@ -2543,6 +2803,60 @@ def _print_wrapped_values(lead: str, items: list[str], *, sep: str = " / ",
         print(line)
 
 
+def _format_option(option: dict) -> str:
+    """一个选项的展示文本：value（label），二者相同时只给 value。
+
+    **用户要传的是 value，label 只是展示标签**——传 label 会被平台判为非法
+    取值（实测：比例传 16:9 而契约取值是 1280x720，必然 400）。
+    """
+    value = str(option.get("value") or "")
+    label = str(option.get("label") or "")
+    return f"{value}（{label}）" if label and label != value else value
+
+
+def _option_group_head(group: dict) -> str:
+    """一组条件选项的档位名（imageSize=1K / mode 已填 / 无条件）。"""
+    when = group.get("when")
+    if not isinstance(when, dict):
+        return "无条件"
+    param = str(when.get("param") or "").strip() or "?"
+    operator = str(when.get("operator") or "eq").strip().lower()
+    if operator == "filled":
+        return f"{param} 已填"
+    if operator == "empty":
+        return f"{param} 未填"
+    value = when.get("value")
+    if operator == "ne":
+        return f"{param}!={value}"
+    return f"{param}={value}"
+
+
+def _render_choice_options(field: dict, mark: str) -> None:
+    """渲染一个 choice 字段的可选值：有条件就**按档位分组**，无条件才平铺。
+
+    分组的理由（生产实证）：`gpt-image-2-stable.aspect_ratio` 有 40 个取值，
+    每个值只属于 1K/2K/4K 三档中的一档；平铺出来用户根本看不出该先选分辨率。
+    这里把「控制器取值 → 一组选项」显式摆出来，并标注**当前命中**的那一组。
+    未命中任何一组时（控制器还没选）并不隐藏任何东西——仍然把每档都列出来，
+    与后端「控制器缺席则放行」的语义一致，用户可以自由选某一档里的值。
+    """
+    groups = field.get("option_groups") or []
+    if not groups:
+        _print_wrapped_values(
+            f"  {_pad(field['name'], 20)} {mark}  可选：",
+            [_format_option(o) for o in field.get("options") or []])
+        return
+    dep = field.get("depends_on")
+    print(f"  {_pad(field['name'], 20)} {mark}  可选（按 {dep} 分档）：")
+    active = field.get("active_group")
+    for index, group in enumerate(groups):
+        head = _option_group_head(group)
+        flag = "（当前命中）" if index == active else ""
+        _print_wrapped_values(
+            f"      [{head}]{flag} ",
+            [_format_option(o) for o in group.get("options") or []])
+
+
 def _render_form(payload: dict) -> None:
     """`form` 的人类可读渲染（agent 应优先用 `--json`，这里便于人工核对）。
 
@@ -2562,12 +2876,12 @@ def _render_form(payload: dict) -> None:
         print(f"计价：{payload['billing_legend']}")
         for family in build_model_families(payload["options"]):
             if len(family["lines"]) > 1:
-                print(f"  ▸ {_safe(family['label'])}　{len(family['lines'])} 条线路")
+                print(f"  ▸ {_safe(family['label'])}　同名 {len(family['lines'])} 个"
+                      f"（编码不同，按编码选）")
             for opt in family["lines"]:
                 print(f"  {_pad(opt['value'], 26)}  {_pad(opt['label'], 18)}  "
                       f"{opt['billing']}　参数 {opt['params_count']} 个")
-                print(f"      线路：{_safe(opt['line_label'])}"
-                      f" ・ {_safe(opt['credit_estimate'])}")
+                print(f"      近似消耗：{_safe(opt['credit_estimate'])}")
         if payload.get("duplicate_note"):
             print()
             print(f"  注意：{payload['duplicate_note']}")
@@ -2575,13 +2889,17 @@ def _render_form(payload: dict) -> None:
             print()
             print("  不可调用：")
             for item in payload["unavailable"]:
-                print(f"    {item['display_name']} —— {item['reason']}")
+                code_text = item.get("model_code") or "-"
+                print(f"    {item['display_name']}（{code_text}）—— {item['reason']}")
     else:
         print(f"模型：{payload['display_name']}（{payload['model_code']}）")
         print(f"计费：{payload['billing']['text']}　典型耗时：{payload['eta']}"
               f"　换算：{payload['credit_rule']}")
         for text in payload["billing"]["surcharge_text"]:
             print(f"  加收：{text}")
+        if payload.get("preset_note"):
+            print()
+            print(f"  已自动采用：{payload['preset_note']}")
         for field in payload["fields"]:
             mark = "必填" if field["required"] else "可选"
             if field["kind"] == "fixed":
@@ -2598,10 +2916,7 @@ def _render_form(payload: dict) -> None:
             else:
                 values = "自由填写"
             if values is None:
-                _print_wrapped_values(
-                    f"  {_pad(field['name'], 20)} {mark}  可选：",
-                    [f"{o['value']}（{o['label']}）" if o["label"] != o["value"] else str(o["value"])
-                     for o in field["options"]])
+                _render_choice_options(field, mark)
             else:
                 print(f"  {_pad(field['name'], 20)} {mark}  {values}")
             label = str(field.get("label") or "")
@@ -2610,6 +2925,13 @@ def _render_form(payload: dict) -> None:
                 detail = f"{label}　{detail}" if detail else label
             if detail:
                 print(f"    {detail}")
+            dep = field.get("depends_on")
+            if dep and field.get("active_group") is None:
+                # 未选控制器时不隐藏任何一档（与后端放行语义一致），
+                # 但要告诉用户「先选它能收窄」——否则 40 项平铺的体感问题没解决。
+                print(f"    → 先确定「{dep}」可收窄可选值；不选也可直接挑上面任一项")
+            if field.get("visible_note"):
+                print(f"    （{field['visible_note']}）")
     if payload.get("credit_estimate_text"):
         print()
         print(f"  {payload['credit_estimate_text']}")
@@ -2653,14 +2975,38 @@ def cmd_form(args) -> int:
     return 0
 
 
+def _preset_params(model: dict | None) -> dict:
+    """契约里**只有唯一取值**的参数：不进面板，自动采用并如实带入请求载荷。
+
+    为什么必须带入：生产 4 个图像模型的 `aspect_ratio` 选项条件依赖的正是单值的
+    `imageSize`（§计划 §1.2）。不带入 → 选项可见集为空 → 面板拿不到任何比例。
+    模型编码本身不算：它由 `--model` 决定，契约里的 `model` 参数只是回显。
+    """
+    preset: dict = {}
+    code = str((model or {}).get("code") or "").strip().lower()
+    for param in (model or {}).get("params") or []:
+        name = str(param.get("name") or "").strip()
+        if not name or name.lower() in {code, "model"}:
+            continue
+        values = [str(v).strip() for v in (param.get("values") or []) if str(v).strip()]
+        if len(values) == 1:
+            preset[name] = values[0]
+    return preset
+
+
 def _build_media_payload(args, key: str, model: dict | None = None) -> dict:
     """构造媒体生成的请求载荷。
 
     参考文件的字段名**从运行时参数契约推导**（`_reference_field_map`），不再写死
     `referenceImages`：契约声明的是别的字段名时，写死会让载荷带着一个平台不认识的
     字段发出去，被**静默忽略**——用户传了参考图却完全没有生效（机制已复现）。
+
+    单值参数（契约里只有唯一取值）在此**自动带入**：它们不进选择面板，但必须
+    出现在请求里，否则平台会按缺参处理（生产 7 个单值参数里 5 个是必填）。
     """
     payload: dict = {"prompt": args.prompt}
+    for name, value in _preset_params(model).items():
+        payload[name] = value
     for name, value in _parse_param_pairs(args.param).items():
         payload[name] = value
 
@@ -2820,6 +3166,11 @@ def _ensure_required_params(model: dict, args, *, kind: str = "media") -> None:
     auto_provided = {"model"}                      # 脚本按 --model 自动写入
     if str(getattr(args, "prompt", None) or "").strip():
         auto_provided.add("prompt")                # --prompt 为命令行必填项
+    # 单值参数由 `_build_media_payload` 自动写入请求体（契约里只有唯一取值，
+    # 用户无从选择），因此必须与 `model` / `prompt` 同等看待。少这条就会出现
+    # 「面板里没有这个参数、请求前却报缺它」——生产 7 个单值参数里 5 个是必填
+    # （`Seedance-2.0-mini-720p` 等 4 个视频模型的 `resolution`）。
+    auto_provided.update(_preset_params(model))
 
     missing = [p["name"] for p in params
                if p["required"]
@@ -3084,6 +3435,10 @@ def cmd_chat(args) -> int:
     protocol, path = select_chat_protocol(model, args.protocol)
     images = [_resolve_reference(value, key) for value in getattr(args, "image", None) or []]
     body = build_chat_body(protocol, model["code"], args, images)
+    # 单值参数自动带入（与媒体路径同一口径）：它们不进参数面板，但仍是模型参数,
+    # 漏传同样会被平台判为缺参。用户显式 `--param` 优先，可覆盖预设。
+    for name, value in _preset_params(model).items():
+        body[name] = value
     for name, value in _parse_param_pairs(args.param).items():
         body[name] = value
 

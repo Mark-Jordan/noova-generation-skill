@@ -333,7 +333,7 @@ class JsonRedactionTest(unittest.TestCase):
     def test_no_wait_json_stdout_is_parseable(self):
         """修复前：`image --no-wait --json` 把「[已提交]…」打到 stdout，agent 解析崩溃。"""
         model = {"code": "m1", "display_name": "M1", "model_type": "image",
-                 "line": "L", "request_format": "openai", "cost_text": "4 积分/次",
+                 "request_format": "openai", "cost_text": "4 积分/次",
                  "billing_mode": "per_call", "billing_price": 4, "billing_unit": "",
                  "doc": "", "ability": [], "alt_codes": [], "description": "",
                  "status": "online", "input_price_per_1m": None,
@@ -498,7 +498,7 @@ class BillingRetryTest(unittest.TestCase):
             return {"status": "running", "id": "T1"}
 
         model = {"code": "m1", "display_name": "M1", "model_type": "image",
-                 "line": "L", "cost_text": "", "billing_mode": "per_call",
+                 "cost_text": "", "billing_mode": "per_call",
                  "billing_price": 1, "billing_unit": "", "doc": ""}
         args = mock.Mock(json=True, quiet=True, no_wait=True, no_credit=True,
                          timeout=90, max_wait=None, poll_interval=6, param=[],
@@ -511,7 +511,7 @@ class BillingRetryTest(unittest.TestCase):
     def test_chat_post_disables_automatic_retry(self):
         seen = {}
         model = {"code": "t1", "display_name": "T1", "model_type": "text",
-                 "status": "online", "line": "L", "request_format": "openai",
+                 "status": "online", "request_format": "openai",
                  "doc": "", "cost_text": "", "billing_mode": "per_token",
                  "billing_price": 0, "billing_unit": "", "ability": [],
                  "input_price_per_1m": None, "output_price_per_1m": None,
@@ -976,6 +976,39 @@ class Python38CompatibilityTest(unittest.TestCase):
                     for alias in node.names:
                         self.assertNotIn(alias.name.split(".")[0], self.BANNED_IMPORTS,
                                          f"{path.name}:{node.lineno} 导入了 {alias.name}")
+
+
+class LineContractRemovalGuardTest(unittest.TestCase):
+    """守门：`line`（线路）相关的**全部**出口不得再出现在脚本里。
+
+    这是 v1.10.0 的对外契约删除项。只靠改判用例挡不住「以后有人手滑再加回来」，
+    所以这里直接对脚本源码做静态检查——线路是运营手填自由文本、可能过期，
+    且**任何数字都不可用于计价**，它的回归就是一次计价误导事故的入口。
+    """
+
+    BANNED = (
+        "line_label",
+        "line_legend",
+        'm["line"]',
+        "model[\"line\"]",
+        "\"line\":",
+        "model_family_key(m)[:0] or model.get(\"line\")",
+    )
+
+    def test_no_line_symbols_left_in_the_scripts(self):
+        for name in ("noova_media.py", "noova_key.py", "noova_common.py", "noova_upload.py"):
+            source = (SKILL_DIR / "scripts" / name).read_text(encoding="utf-8")
+            for needle in self.BANNED:
+                with self.subTest(file=name, needle=needle):
+                    self.assertNotIn(needle, source,
+                                     f"{name} 仍存在线路残留：{needle}")
+
+    def test_no_exported_line_key_in_any_json_payload(self):
+        """`models` / `params` / `model` / `form` 的 JSON 出口都不得含 `line` 键。"""
+        for name in ("noova_media.py",):
+            source = (SKILL_DIR / "scripts" / name).read_text(encoding="utf-8")
+            self.assertNotIn("\"line\"", source)
+            self.assertNotIn("'line'", source)
 
 
 class ConfigIsolationGuardTest(unittest.TestCase):
