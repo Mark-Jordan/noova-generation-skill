@@ -571,7 +571,7 @@ def _align_option_visible_when(raw_rules: object, expected_len: int) -> list:
     但这是运行时可变的对外数据，**长度不等时不得让下标错位**——错位等于把
     条件 A 的规则安到取值 B 上，用户按面板选出来的值会被平台 400 拒绝。
     因此一律以 values 长度为准裁剪/补 None；None 的语义是「无条件的可见」，
-    与后端 _evaluate_visible_when 对空规则的默认放行逐条一致：
+    与平台服务端「无规则即放行」的判定逐条一致：
     异常只会**多显示**选项，绝不**少显示**（后者会让面板拿不到任何选项）。
     """
     if not isinstance(raw_rules, list):
@@ -879,7 +879,7 @@ def approximate_credit(model: dict) -> dict:
     for rule in rules:
         bounds = _rule_credit_bounds(rule, model)
         if bounds is None:
-            return _out("usage", "按用量计价（见加收规则）")
+            return _out("usage", "按用量计价")
         low, high, detail = bounds
         lower = round(lower + low, 2)
         upper = round(upper + high, 2)
@@ -887,7 +887,7 @@ def approximate_credit(model: dict) -> dict:
     if lower <= 0 or upper <= 0:
         # 下界为 0 时「0~N」看起来像"最便宜那档免费"，上界为 0 时是计费配置异常。
         # 两种情况给区间都会误导，宁可如实定性。
-        return _out("usage", "按用量计价（见加收规则）")
+        return _out("usage", "按用量计价")
     detail = "、".join(details)
     if lower == upper:
         return _out("exact", "%s 积分/次" % _fmt_num(lower), lower, upper, detail)
@@ -1254,11 +1254,35 @@ def _authoritative_credits(pricing: object) -> tuple[float, bool] | None:
 
 
 def _pricing_note(pricing: object) -> str:
+    """服务端给不出确定值的原因——**只进机器可读字段，不上用户文案**。
+
+    服务端的 `note` 是给调用方（agent）的接口指令，例如
+    「请核对参数取值后用 params 重新询价」。它有助于 agent 自行决策，
+    但**不能出现在用户可见输出里**——见 `credit_estimate_text`。
+    """
     if isinstance(pricing, dict):
         note = str(pricing.get("note") or "").strip()
         if note:
             return note
-    return "参数决定价格"
+    return "服务端未给出确定金额，以生成结算为准"
+
+
+def _estimate_with_authoritative(estimate: dict, pricing: object) -> dict:
+    """把本地复算结果换成**服务端权威口径**（数值层与文案层同源）。
+
+    服务端没作答（`pricing` 为 None）或答了但给不出确定值时，一律把数字清空，
+    **绝不拿本地复算顶替**——报价与真值冲突时以服务端结算为准，此时任何数字都可能
+    与最终扣减对不上。原因写进 `note`（机器可读，供 agent 决策），不上用户文案。
+    `credit_estimate_text` 走同一判断，两者必须始终一致。
+    """
+    resolved = _authoritative_credits(pricing)
+    credits, exact = resolved if resolved is not None else (None, False)
+    if not exact:
+        credits = None          # 与 credit_estimate_text 同口径：不确定就不给数字
+    ratio = _credits_per_yuan()
+    return {**estimate, "exact": exact, "credits": credits,
+            "yuan": (round(credits / ratio, 4) if credits is not None and ratio else None),
+            "note": "" if exact else _pricing_note(pricing)}
 
 
 def fetch_credit(key: str, *, timeout: int = 20) -> dict | None:
@@ -1468,15 +1492,50 @@ def _poll_until_done(task_id: str, key: str, args, model_type: str = "") -> dict
         time.sleep(interval)
 
 
+def _pricing_quote_params(model: dict, payload: dict) -> dict:
+    """挑出**参与计费的参数**用于询价（其余一律不传）。
+
+    两个理由，都不能省：
+
+    1. **自由文本会撑爆 URL**。`fetch_pricing` 把参数塞进 `?params=`（GET）；
+       实测 1200 字的提示词编码后 10KB+，超过 nginx 默认 8KB 请求头上限，
+       服务端 414、询价静默失败——用户看不到任何错误，报价只能退化成
+       「本次消耗以生成结算为准」（不再给数字，见 `credit_estimate_text`）。
+    2. **用户创作内容不该进 URL**。提示词会落进各级访问日志，而它不参与计价。
+
+    取参与计费的参数 = 契约 `surchargeRules[].param`（后端结算与契约用的是同一份规则）。
+    没有任何一条命中时返回空 dict，服务端按「未传参数」作答——与用户实际没选该参数一致。
+    """
+    keys = {str(rule.get("param") or "").strip()
+            for rule in (model.get("surcharge_rules") or []) if isinstance(rule, dict)}
+    keys.discard("")
+    return {name: value for name, value in (payload or {}).items() if name in keys}
+
+
 def _announce_cost(model: dict, payload: dict, *, quiet: bool = False) -> None:
     """提交前在 **stderr** 报价：用户/agent 在扣费前必须看到本次预计消耗。
 
     只走 stderr —— `--json` 的 stdout 必须保持是纯 JSON。
+
+    **有加收规则时必须按本次真实参数询价**：契约自带的 `pricing` 是「不传参数」的
+    默认组合价，直接复用会给出底价——实测 `nano-banana-pro` 选 `imageSize=4K` 时
+    面板报 22、提交却报 20；时长型模型更糟（默认组合给不出确定值，退化成
+    「未给出确定金额」）。无加收规则时价格与参数无关，契约 `pricing` 即真值，
+    不发这次请求（此时代码传 `None`，由 `credit_estimate_text` 取契约 `pricing`）。
+
+    取价策略与 `build_param_form` 保持一致——两处口径不同就会出现「面板报一个价、
+    提交报另一个价」。
     """
     if quiet:
         return
+    # 契约自带的 `pricing` 是**不传参数**的默认组合价，对「本次参数」而言与底价等价，
+    # 不能当权威价用；有加收规则时必须按本次参数重新询价，询价失败宁可本地复算。
+    # 询价失败传**空 dict**（而不是 None）：None 会让 `credit_estimate_text` 退回那份
+    # 默认组合价，等于又报回底价；空 dict 强制走「本地按本次参数复算」。
+    pricing = (fetch_pricing(model, _pricing_quote_params(model, payload)) or {}
+               if model.get("surcharge_rules") else None)
     try:
-        text = credit_estimate_text(model, payload)
+        text = credit_estimate_text(model, payload, pricing=pricing)
     except NoovaError:
         raise
     print(f"[费用] {text}", file=sys.stderr)
@@ -1686,7 +1745,7 @@ def _price_text(model: dict) -> str:
     if price > 0:
         return f"{_fmt_num(price)} 积分/{unit} 次" if unit > 1 else f"{_fmt_num(price)} 积分/次"
     if model.get("surcharge_rules"):
-        return "按用量计价（见加收规则）"
+        return "按用量计价"
     return "未公布单价（以平台计价为准）"
 
 
@@ -1712,8 +1771,8 @@ def _price_cell(model: dict) -> str:
         return "按量计费"
     if _billing_mode(model) in ("per_request", "per_time") and not _base_price(model)[0] \
             and model.get("surcharge_rules"):
-        # 表格里塞不下「按用量计价（见加收规则）」（实测把行撑到 83 列、80 列终端折行）；
-        # 加收规则紧跟在该行下方逐条列出，单元格只需说清「不是固定单价」。
+        # 表格里塞不下「按用量计价」以外的解释（实测长句把行撑到 83 列、80 列终端折行）；
+        # 单元格只需说清「不是固定单价」，明细不在人读输出里逐条列（见 changelog 1.10.0）。
         return "按用量计价"
     return _price_text(model)
 
@@ -1762,7 +1821,7 @@ def _rule_param_name(rule: dict) -> str:
 def _match_surcharge_charge(rule: dict, params: dict) -> float | None:
     """一条加收规则在给定参数下要加收多少积分；不命中返回 None。
 
-    与平台网关结算逐条对齐（`_resolve_param_rule_charge_cost`）：
+    与平台服务端结算口径逐条对齐：
       - 参数没传 → 规则不参与（返回 None）；
       - `present` 命中但取值无法解析成数值 → **抛错**（服务端会 fail-closed 拒绝请求，
         本地不能给一个「看着能过、实际会被拒」的报价）；
@@ -1805,10 +1864,9 @@ def _match_surcharge_charge(rule: dict, params: dict) -> float | None:
     if charge == "multiply_by_value":
         actual = _number(raw)
         multiplier = _number(rule.get("multiplier"))
-        # 契约**没有 `base` 键**时按 0 计：后端投影只在 base 非 0 时输出该键
-        # （`api_gateway_model_service._project_surcharge_rules`），实际结算读的是
-        # DB 规则里的 `charge_base`（生产为 `"0.00"`）。本文件的近似价
-        # `_rule_credit_bounds` 与网关 `_resolve_param_rule_charge_cost` 都按 0 处理；
+        # 契约**没有 `base` 键**时按 0 计：服务端投影只在 base 非 0 时输出该键，
+        # 而结算侧读的是规则配置里的基准值（未配置时按 `0`）。本文件的近似价
+        # `_rule_credit_bounds` 与服务端结算口径都按 0 处理；
         # 精确价分支若把「缺 base」当成「取值非法」，就会对同一份契约报出自相矛盾的
         # 结论——线上 4 个时长加收模型的精确报价因此**直接崩溃**（exit 1）。
         # 只有 `multiplier` 缺失才是真正的规则配置非法，仍旧 fail-closed。
@@ -1833,7 +1891,7 @@ def _match_surcharge_charge(rule: dict, params: dict) -> float | None:
 def compute_credit_cost(model: dict, params: dict | None = None) -> dict:
     """按**平台网关的真实结算口径**本地复算本次预计消耗积分。
 
-    与服务端 `_calculate_cost_decimal` + `_resolve_param_rule_charge_cost` 对齐：
+    与平台服务端结算口径对齐：
 
     - `per_request` / `per_time`：`base = 单价 × 计费单位`，再加各条命中的加收规则，
       四舍五入到 2 位小数 → 可以给出**确定值**（`exact=True`）；
@@ -1904,31 +1962,35 @@ def credit_estimate_text(
 ) -> str:
     """一句话报价（用户确认生成前必须看到）。
 
-    **口径优先级（计划 §4.5）**：
-    1. 服务端权威价（${Q}pricing.credits${Q}，由服务端真实结算函数算出）→ 直接照抄上屏，
-       调用方**不再自己算**；
-    2. 服务端明确给不出确定值（${Q}credits=null${Q}）→ 如实说明原因，不编数字；
-    3. 旧后端没有 ${Q}pricing${Q} 块 → 回退本地按契约的**预估**，文案必须带「预估」字样。
+    **口径（唯一数字来源 = 服务端确定值）**：
+    1. 服务端给出确定值（`pricing.credits` + `exact=true`）→ 照抄上屏，调用方**不自己算**；
+    2. 其余一切情况（服务端明说给不出 / 旧后端没有 `pricing` 块 / 按 token 结算）
+       → **不显示任何金额**，只把用户引向生成后的真实扣减。
 
-    唯一可核对的真值始终是生成结束后的「本次扣减（账户余额差值）」。
+    **为什么不给数字**：报价与真值可能冲突，冲突时一律以服务端结算为准；给不出确定值时，
+    任何数字（含本地按契约复算的「预估」）都可能与最终扣减对不上，摆到用户面前就是误导。
+    用户真正需要的信息，生成结束后的「本次扣减（账户余额差值）」已经完整给出——
+    余额变了多少，就是花了多少。
+
+    **也不转述服务端的 `note`**：如「请核对参数取值后用 params 重新询价」是**给 agent 的
+    接口指令**，不是给用户的解释。该原因只保留在 `credit_estimate.note`（机器可读）里，
+    供 agent 自行决策，**不得出现在用户可见文案中**。
     """
     ratio = _credits_per_yuan()
     rule = f"{_fmt_num(ratio)} 积分 = 1 元"
     resolved = pricing if isinstance(pricing, dict) else model.get("pricing")
-    if isinstance(resolved, dict) and "credits" in resolved:
-        # 服务端已作答：给得出确定值就照抄，给不出就如实说明（绝不回退本地猜一个数）。
-        authoritative = _authoritative_credits(resolved)
-        credits, exact = authoritative if authoritative is not None else (None, False)
+    # 唯一数字来源 = 服务端的确定值。只有它才与最终扣减同源（同一结算函数）。
+    authoritative = _authoritative_credits(resolved) if isinstance(resolved, dict) else None
+    if authoritative is not None:
+        credits, exact = authoritative
         if credits is not None and exact:
             return (f"服务端权威价：{_fmt_num(credits)} 积分"
                     f"（≈ {_fmt_num(round(credits / ratio, 4)) if ratio else None} 元；{rule}）")
-        return f"服务端未给出确定金额（{_pricing_note(resolved)}）；换算：{rule}"
-    estimate = compute_credit_cost(model, params)
-    if estimate["exact"]:
-        return (f"按契约预估：{_fmt_num(estimate['credits'])} 积分"
-                f"（≈ {_fmt_num(estimate['yuan'])} 元；{rule}；"
-                f"真实扣费以服务端结算为准）")
-    return f"按实际用量结算（{estimate['note']}）；换算：{rule}"
+    # 服务端给不出确定值（含按 token 结算、询价失败、旧后端无 pricing）：
+    # **不给任何数字**，也不转述服务端 note（那是给 agent 的接口指令）。
+    # 报价与真值可能冲突，冲突时以服务端结算为准；此时唯一可信的信息是
+    # 生成结束后的「本次扣减（账户余额差值）」——余额变了多少就是花了多少。
+    return "本次消耗以生成结算为准（生成结束后显示账户余额变化）"
 
 
 def model_protocols(model: dict) -> list[str]:
@@ -2109,8 +2171,6 @@ def cmd_models(args) -> int:
                 print(f"  {_pad(code_cell, w_code)}  {_pad(model['display_name'], w_name)}  "
                       f"{_pad(model_protocol_text(model), w_proto)}  "
                       f"{_pad(_status_label(model['status']), w_state)}  {_price_cell(model)}")
-                for text in billing_spec(model)["surcharge_text"]:
-                    print(f"    ↳ 加收：{text}")
 
     if args.type in (None, "audio") and not by_type.get("audio"):
         print()
@@ -2182,8 +2242,6 @@ def _print_contract(spec: dict, model: dict) -> None:
     print(f"调用　：{TYPE_MODE_HINTS.get(spec['model_type'], '-')}")
     print(f"典型耗时：{_eta_text(spec['model_type'])}")
     print(f"计费　：{_safe(spec['billing']['text'])}")
-    for text in spec["billing"]["surcharge_text"]:
-        print(f"　加收　：{_safe(text)}")
     ratio = _credits_per_yuan()
     print(f"换算　：{_fmt_num(ratio)} 积分 = 1 元"
           f"（即 1 积分 ≈ {_fmt_num(round(1 / ratio, 4))} 元）")
@@ -2381,7 +2439,7 @@ def _option_rule_key(rule: object) -> tuple | None:
 
 
 def _option_rule_matches(rule: dict, params: dict) -> bool:
-    """当前已知参数下，这条选项规则是否命中（语义与后端 `_evaluate_visible_when` 对齐）。
+    """当前已知参数下，这条选项规则是否命中（语义与平台服务端判定对齐）。
 
     只做**只读判断**：控制器参数未提供时返回 `False`（不是「不可见」，而是
     「无法判断」——调用方据此退回「按组列出、不阻拦」的渲染，见 SKILL.md）。
@@ -2658,14 +2716,33 @@ def build_param_form(model: dict, *, model_type: str | None = None,
         estimate_params = {**preset_params, **chosen_params}
         # 权威价优先：服务端用真实结算函数算（服务端出数，调用方不自算）。
         # 拿不到（旧后端/网络失败）时回退本地预估，文案由 credit_estimate_text 标注「预估」。
-        authoritative = fetch_pricing(model, estimate_params)
+        # 与 `_announce_cost` **同一套取价策略**（两处口径必须一致，否则面板与提交报不同价）：
+        #   有加收规则 → 按本次参数询价（只带参与计费的参数，见 _pricing_quote_params）；
+        #   无加收规则 → 价格与参数无关，契约自带 `pricing` 即真值，不再多打一次请求。
+        if model.get("surcharge_rules"):
+            authoritative = fetch_pricing(
+                model, _pricing_quote_params(model, estimate_params)
+            )
+        else:
+            authoritative = model.get("pricing")
         estimate = compute_credit_cost(model, estimate_params)
-        payload["chosen_params"] = chosen_params
-        payload["credit_estimate"] = estimate
+        # 数值层与文案层**必须同源**：两层都只认服务端的确定值。
+        # 服务端给不出确定值时，两层同时留空——否则会出现「文案说以结算为准、
+        # 数值层却顶一个本地复算数字」，agent 读到哪个全凭运气，而该数字
+        # 可能与最终扣减对不上（报价与真值冲突时一律以服务端结算为准）。
+        estimate = _estimate_with_authoritative(estimate, authoritative)
         if authoritative is not None:
             payload["credit_authoritative"] = authoritative
+        payload["chosen_params"] = chosen_params
+        payload["credit_estimate"] = estimate
+        # 文案层只吃**服务端作答**（authoritative）：不传契约自带的默认组合价，
+        # 也不让本地复算顶替。给不出确定值就只说「以生成结算为准」。
+        # 询价失败时传**空 dict**而不是 None：None 会让文案层退回契约 `pricing`
+        # （那是「不传参数」的默认组合价，对本次参数而言与底价等价），
+        # 于是出现「面板报 20、提交却说不给数字」——与 `_announce_cost` 口径必须一致。
         payload["credit_estimate_text"] = credit_estimate_text(
-            model, estimate_params, pricing=authoritative
+            model, estimate_params,
+            pricing=(authoritative if authoritative is not None else {}),
         )
     if not fields:
         payload["empty_note"] = ("该模型未提供参数契约条目；只有提示词可填。"
@@ -2895,8 +2972,6 @@ def _render_form(payload: dict) -> None:
         print(f"模型：{payload['display_name']}（{payload['model_code']}）")
         print(f"计费：{payload['billing']['text']}　典型耗时：{payload['eta']}"
               f"　换算：{payload['credit_rule']}")
-        for text in payload["billing"]["surcharge_text"]:
-            print(f"  加收：{text}")
         if payload.get("preset_note"):
             print()
             print(f"  已自动采用：{payload['preset_note']}")
@@ -3234,27 +3309,57 @@ def _normalize_option_key(value: object) -> str | None:
     return rendered if "e" in rendered.lower() else rendered.rstrip("0").rstrip(".")
 
 
+def _range_problem(param: dict, name: str, value) -> str | None:
+    """数值型参数的 `min`/`max` 预检；越界返回人读说明，否则 None。
+
+    为什么必须拦：面板报价已经按用户给的数算出金额（`duration=999` → 24975 积分），
+    而平台会因为越界直接 400 拒单。不拦就是「先报一个不可能成交的价」。
+    判据只有契约 `min`/`max`，缺的边不设限。平台服务端用的是同一组边界值，
+    但它会先做参数名归一与类型归一，本函数只按契约里的 `name` 精确匹配 ——
+    这里**只是本地预检**，
+    真正的裁决仍以平台返回为准，故判不准的一律放行。
+    """
+    if str(param.get("type") or "").strip().lower().replace(" ", "") not in _NUMERIC_PARAM_TYPES:
+        return None
+    low, high = _finite_number(param.get("min")), _finite_number(param.get("max"))
+    if low is None and high is None:
+        return None
+    if value is None:
+        return None                      # 非数值（含列表）交给后端判，不在这里猜
+    if low is not None and value < low:
+        return f"{name} 不能小于 {_fmt_num(low)}（当前 {_fmt_num(value)}）"
+    if high is not None and value > high:
+        return f"{name} 不能大于 {_fmt_num(high)}（当前 {_fmt_num(value)}）"
+    return None
+
+
 def _ensure_param_values(model: dict, args) -> None:
-    """发请求前核对「枚举参数的取值」是否在契约 `values` 里。
+    """发请求前核对「参数取值」是否满足契约：枚举白名单 + 数值范围。
 
     为什么必须在本地拦：契约里的 `values` 才是合法取值，而**展示标签**（`valueLabels`，
     如像素串 `1280x720` 的标签 `16:9`）长得更像人话，极易被当成可传值——实测图像模型的
-    `aspect_ratio` 传标签必然拿到 HTTP 400，白跑一次往返。
+    `aspect_ratio` 传标签必然拿到 HTTP 400，白跑一次往返。数值越界同理：面板已经
+    按用户给的数报了价，平台却会拒单，等于先报一个不可能成交的价。
 
     保守放行原则（宁可少拦，不可误拦）：
       - 参数不在契约里 → 不管（平台对未知键是**静默忽略**，文档已声明，不阻断）；
-      - 契约 `values` 为空   → 该参数是自由文本，不校验；
-      - 数组型参数          → 元素逐个比（`--ref-image` 那类走专门选项，一般不在此路径）。
+      - 契约 `values` 为空   → 该参数是自由文本，不校验枚举；
+      - 数组型参数          → 元素逐个比（`--ref-image` 那类走专门选项，一般不在此路径）；
+      - 数值交给 `--param` 时可能仍是字符串 → 先在本地转成数值再比，转不动就放行。
     """
     params = model.get("params") or []
     if not params:
         return
     by_name = {p.get("name"): p for p in params}
     problems: list[tuple[str, list[str], list[str]]] = []
+    range_problems: list[str] = []
     for name, value in _parse_param_pairs(getattr(args, "param", None)).items():
         param = by_name.get(name)
         if not param:
             continue
+        problem = _range_problem(param, name, _finite_number(value))
+        if problem and problem not in range_problems:
+            range_problems.append(problem)
         allowed = [str(v).strip() for v in (param.get("values") or []) if str(v).strip()]
         if not allowed:
             continue  # 自由文本参数：无枚举可校验
@@ -3268,6 +3373,13 @@ def _ensure_param_values(model: dict, args) -> None:
         problems.append((name, given, shown))
 
     if not problems:
+        if range_problems:
+            # 越界是**确定性失败**：重试不会变好，只能改数值。文案只说清边界与当前值。
+            raise NoovaError(
+                "参数取值超出契约范围：" + "；".join(range_problems),
+                hint="请按上面给出的上下限重新取值（本类错误重试无效）",
+                details=[f"查看契约：params --code {model.get('code', '<模型编码>')} --json"],
+            )
         return
 
     # 命中「用户把标签当取值传了」时给一条针对性的提示——这是最高频的误用。

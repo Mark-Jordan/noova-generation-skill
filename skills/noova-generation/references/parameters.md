@@ -46,12 +46,13 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 |---|---|---|
 | `exact` | 单价固定且与参数无关 | 直接报 `text`（如 `20 积分/次`） |
 | `range` | 加收参数在契约里有 `min`/`max`，能算出区间 | 报 `text`（如 `约 260~1950 积分/次`），`detail` 是依据（`duration 4~30 × 65 积分`） |
-| `usage` | 按 token 结算，或边界推不出来 | **只给定性文案**（`按用量计价（见加收规则）`），**绝不可编数字** |
+| `usage` | 按 token 结算，或边界推不出来 | **只给定性文案**（`按用量计价`），**绝不可编数字** |
 
 参数定好后优先用**服务端权威价**：`form --code <编码> --param 名=值 --json` 的
-`credit_estimate_text` 会先向服务端询价（`GET /api/models/params?model=&params=`）并照抄
-`pricing.credits`；只有旧后端没有 `pricing` 块时才回退到按 `billing` + `surchargeRules`
-的本地预估（文案会明确写「按契约预估」，见 §5）。
+`credit_estimate_text` 会先向服务端询价（`GET /api/models/params?model=&params=`），
+**仅在服务端给出确定值时**才显示数字（照抄 `pricing.credits`）。
+服务端给不出确定值时，文案只说「本次消耗以生成结算为准」，**不给任何金额**——
+此时唯一可信的是生成结束后的「本次扣减（账户余额差值）」（见 §5）。
 
 `params --json` 的 `params[]` 每项结构：
 
@@ -89,7 +90,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | `empty` | 控制器**未填写** | 否 |
 
 **平台的行为（决定面板不能强制用户先选）**：取值不在当前可见集合里、且集合非空 → `400`；
-但**控制器缺席时集合为空 → 平台保守放行**（`schema_constraints` 的「无可见选项时不强制」）。
+但**控制器缺席时集合为空 → 平台保守放行**（即「无可见选项时不强制」）。
 所以面板的正确做法是：**按档位分组展示、提示先选控制器、但不阻拦用户直接选任意档里的值**。
 
 单值参数（`values` 恰好 1 个）**照常参与条件求值**：它不进面板，但脚本会自动采用它的唯一取值。
@@ -108,7 +109,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
   "invocation": { "mode": "task", "create": "POST /api/v1/invoke", "poll": "POST /v1/content",
                   "stream_supported": false },
   "billing": { "mode": "per_request", "price": 0, "unit": 1,
-               "text": "按用量计价（见加收规则）",
+               "text": "按用量计价",
                "surcharge_rules": [{ "param": "duration", "match": "present",
                                      "charge": "multiply_by_value", "multiplier": 25 }],
                "surcharge_text": ["提供 duration 时，按 duration × 25 积分 计"] },
@@ -135,7 +136,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | "有哪些模型？" | 跑 `models` 后按**类型分区**回答，给出编码、名称、协议、状态与计价；同名模型会带族标题，把同名的每个编码与计价都列出；并说明"清单实时变化" |
 | "同名模型怎么区分？" | **只靠模型编码**。`models` 把同名的一组摆在一起并给出各自编码与计价，`params --code <编码>` 拿到单个模型的契约。编码就是请求里要传的 `model` 值，是唯一可靠的选择键（不引入任何展示用的近似标签） |
 | "大概要多久？" | 按类型给区间（文本 1–10 秒首字符；图像 30 秒–5 分钟；音频 30 秒–10 分钟；视频 1 分钟–1.5 小时），并强调"以实际任务为准" |
-| "要花多少积分？" | 引用 `billing.text`（口径见 §5）；实际消耗以生成结束时的「本次扣减（余额差值）」为准 |
+| "要花多少积分？" | **参数已定时**引用 `credit_estimate_text`（口径见 §5 规则 4）：**只在服务端给出确定值时才报数字**（服务端权威价）；服务端给不出确定值时**不报任何金额**，直接说明"以生成结算为准"。`billing.text` 只是**基础单价**，含加收参数时它比实付低（如标价 20 积分/次、选 4K 实付 22），单独引用会报低保价。实际消耗以生成结束时的「本次扣减（余额差值）」为准 |
 | "推荐哪个模型？" | 可以按 `models` 返回的类型/计价信息给出建议，但**必须先说明依据**，不要编造性能排名 |
 
 ---
@@ -153,7 +154,8 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 5. **数组型参数**（如参考图列表）用 `--ref-image`（可重复）或 `--param name=a,b` 形式；
    具体字段名以参数契约为准。
 6. **没有默认值**：不传就是没设置（与网页画布不同，画布会替你补默认值）。
-   数值型参数有区间（`min`/`max`），越界会被平台拒绝。
+   数值型参数有区间（`min`/`max`），越界会被平台拒绝——脚本已在**发请求前**按契约预检并
+   报出边界（`参数取值超出契约范围：…`），该类错误**重试无效**，只能改数值。
 7. **参数无法确认时**：可以先不传，用模型的默认行为生成；或者向用户说明"该模型文档未提供此参数"。
 8. **枚举参数要传 `value`，不是 `label`**（最容易踩的一条，已多次实测）：
    - 契约的 `values` 是**合法取值**，`valueLabels` 是这些取值的**中文展示标签**。
@@ -213,7 +215,7 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
 | `price` / `unit` | 按次/按时的单价与计费单位（`price × unit` 即一次基础费用） |
 | `price_per_1m` | 按 token 计费时的四档单价（见下） |
 | `surcharge_rules` | 参数加收规则（机器可读，原样透传） |
-| `surcharge_text` | 同一批规则的人读句子（与 `surcharge_rules` 同源，避免口径漂移） |
+| `surcharge_text` | 同一批规则的人读句子（与 `surcharge_rules` 同源，避免口径漂移）。**只在 `--json` 里**；`models`/`model`/`params`/`form` 的人读输出已不再逐条打印加收明细 |
 
 **四档 token 单价**（`mode = per_token` 时出现，**单位 = 积分/百万 tokens**）：
 `input`（输入）、`output`（输出）、`cacheHit`（缓存命中）、`cacheWrite`（缓存写入）。
@@ -238,14 +240,19 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码>
    （`models` 清单表格里这一列写作紧凑的 `X/Y`，单位由表格上方的「计价列」图例统一说明——
    逐行重复单位会把行撑到 100+ 列、在 80 列终端折行拆散表格。向用户转述时用完整说法。）
 2. `mode = per_request` / `per_time` 且 `price > 0` → 「X 积分/次」（`unit > 1` 时写「X 积分/N 次」）。
-3. **`price = 0` → 绝不能说「0 积分/次」或"免费"**：这表示单价改由 `surcharge_rules`
-   按用量（时长等）计价。此时引用 `surcharge_text`，或如实说"以平台当前计价为准"。
-4. **报价优先用服务端权威价**：用户选定参数后，用 `form --code <编码> --param 名=值 --json` 拿
-   `credit_estimate_text`——它先向服务端询价，成功时文案是「**服务端权威价**：N 积分」
-   （`pricing.credits`，由服务端真实结算函数算出，**调用方不要自己算**）；
-   服务端给不出确定值时如实说明原因（`credits: null` + `note`）；
-   只有旧后端没有 `pricing` 块时才回退本地复算，文案是「**按契约预估**」。
-   真实扣费以生成结束时的「本次扣减（账户余额差值）」为准。
+3. **`price = 0` → 绝不能说「0 积分/次」或"免费"**：这表示单价改由参数计价
+   （时长等）。此时只说「按用量计价」，或如实说"以平台当前计价为准"。**人读输出不列
+   加收明细**（费率分解只在 `billing.surcharge_rules` / `surcharge_text` 这类机器可读字段里）。
+4. **报价只在服务端给出确定值时才显示数字**：用户选定参数后，用
+   `form --code <编码> --param 名=值 --json` 拿 `credit_estimate_text`——它先向服务端询价，
+   只有服务端给出确定值（`pricing.credits` + `exact: true`，由服务端真实结算函数算出，
+   **调用方不要自己算**）时，文案才是「**服务端权威价**：N 积分」。
+   **服务端给不出确定值时不给任何金额**（文案：`本次消耗以生成结算为准（生成结束后显示账户余额变化）`）。
+   此时唯一可信的是生成结束时的「本次扣减（账户余额差值）」——余额变了多少就是花了多少。
+   给不出确定值时，**不要另找一个数字补上**（包括本地按 `billing` + `surchargeRules` 的复算）：
+   报价与真值冲突时以服务端结算为准，任何替代数字都可能与最终扣减对不上。
+   **不要把服务端 `note` 转述给用户**（如「请核对参数取值后用 params 重新询价」）——那是给
+   agent 的接口指令；它只保留在机器可读字段 `credit_estimate.note` 里供 agent 决策。
    单值参数已自动并入报价（`preset_params`），不需要用户提供。
 5. **积分换算成人民币时用 `credit_per_yuan`**（当前 100，即 **100 积分 = 1 元**）。
    报钱数时把换算比例一并说清，避免用户拿积分当"元"理解。

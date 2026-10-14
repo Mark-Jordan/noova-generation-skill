@@ -357,8 +357,12 @@ class CreditCostTest(unittest.TestCase):
         self.assertIn("最低扣费", cost["note"])
 
     def test_estimate_text_states_the_ratio(self):
+        """服务端给了确定值 → 报数字，并带上换算比例。"""
         model = spec_model(billing={"mode": "per_request", "price": 125.0, "unit": 1})
-        text = nm.credit_estimate_text(model, {})
+        text = nm.credit_estimate_text(
+            model, {},
+            pricing={"exact": True, "credits": 125.0, "yuan": 1.25, "note": None},
+        )
         self.assertIn("125 积分", text)
         self.assertIn("1.25 元", text)
         self.assertIn("100 积分 = 1 元", text)
@@ -367,7 +371,10 @@ class CreditCostTest(unittest.TestCase):
         """比例从契约取：服务端改成 200 时，文案必须跟着变。"""
         model = spec_model(billing={"mode": "per_request", "price": 100.0, "unit": 1})
         nm._SPEC_CACHE["credit_per_yuan"] = 200.0
-        text = nm.credit_estimate_text(model, {})
+        text = nm.credit_estimate_text(
+            model, {},
+            pricing={"exact": True, "credits": 100.0, "yuan": 0.5, "note": None},
+        )
         self.assertIn("200 积分 = 1 元", text)
         self.assertIn("0.5 元", text)
 
@@ -386,27 +393,52 @@ class CreditCostTest(unittest.TestCase):
         self.assertNotIn("预估", text)
 
     def test_estimate_text_uses_contract_pricing_when_params_absent(self):
-        """不传参数时用契约里的默认组合价（contract pricing 块）。"""
+        """不传参数时用契约里的默认组合价（contract pricing 块）——它也是服务端作答。"""
         model = spec_model(billing={"mode": "per_request", "price": 125.0, "unit": 1},
                            pricing={"exact": True, "credits": 20.0})
         self.assertIn("20 积分", nm.credit_estimate_text(model, {}))
 
-    def test_estimate_text_reports_null_without_inventing_number(self):
-        """服务端明确给不出确定值 → 如实说明，绝不编一个数字（F-5）。"""
+    def test_estimate_text_reports_no_amount_when_server_cannot_price(self):
+        """服务端明确给不出确定值 → **不显示任何金额**，也不转述它的原因。
+
+        原因（`note`）是给 agent 的接口指令，例如「请核对参数取值后用 params 重新询价」；
+        转述给用户只会造成困惑。用户真正需要的是生成后的余额变化。
+        """
         model = spec_model(billing={"mode": "per_request", "price": 0.0, "unit": 1})
         text = nm.credit_estimate_text(
             model,
             {},
             pricing={"exact": False, "credits": None, "note": "该模型价格取决于参数：duration"},
         )
-        self.assertIn("服务端未给出确定金额", text)
-        self.assertIn("duration", text)
+        self.assertNotIn("duration", text)
+        self.assertNotIn("params", text)
+        self.assertNotIn("积分 = 1 元", text)
+        self.assertNotIn("0 积分", text)
+        self.assertIn("以生成结算为准", text)
 
-    def test_estimate_text_falls_back_to_local_estimate_for_old_backend(self):
-        """旧后端无 pricing 块 → 回退本地预估，文案必须带「预估」。"""
+    def test_estimate_text_never_falls_back_to_a_local_number(self):
+        """旧后端无 pricing 块（或询价失败）→ 同样不给数字。
+
+        本地复算与服务端结算并不总是等价：存在服务端明说给不出确定值、本地却算得出
+        数字的情形。冲突时以服务端为准，因此本地数字一律不上屏。
+        """
         model = spec_model(billing={"mode": "per_request", "price": 125.0, "unit": 1})
         text = nm.credit_estimate_text(model, {}, pricing=None)
-        self.assertIn("按契约预估", text)
+        self.assertNotIn("125", text)
+        self.assertNotIn("预估", text)
+        self.assertIn("以生成结算为准", text)
+
+    def test_estimate_text_hides_the_server_note_from_users(self):
+        """服务端 note 只进机器可读字段，**不进用户文案**（含 --json 之外的人读路径）。"""
+        model = spec_model(billing={"mode": "per_request", "price": 20.0, "unit": 1})
+        note = "该模型价格取决于参数：imageSize；请核对参数取值后用 params 重新询价"
+        text = nm.credit_estimate_text(
+            model, {},
+            pricing={"exact": False, "credits": None, "note": note},
+        )
+        self.assertNotIn("imageSize", text)
+        self.assertNotIn("params", text)
+        self.assertNotIn("重新询价", text)
 
     def test_fetch_pricing_is_fail_soft(self):
         model = spec_model()
@@ -444,6 +476,202 @@ class CreditCostTest(unittest.TestCase):
                     nm, "_request", return_value={"data": {"models": [{"model": "demo-model"}]}}
                 ):
             self.assertIsNone(nm.fetch_pricing(model))
+
+    # ── 提交时报的价必须是**本次参数**的价，不能是契约的默认组合价 ────────
+
+    @staticmethod
+    def _surcharged(contract_pricing, *, price=20.0):
+        """带选项加收的模型：契约自带 pricing 是「不传参数」的默认组合价。"""
+        return spec_model(
+            billing={"mode": "per_request", "price": price, "unit": 1},
+            pricing=contract_pricing,
+            surchargeRules=[{"param": "quality", "match": "exact",
+                             "matchValue": "high", "charge": "fixed", "credits": 2.0}])
+
+    def _announce_text(self, model, payload, *, quoted):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with mock.patch.object(nm, "fetch_pricing", return_value=quoted), \
+                contextlib.redirect_stderr(err):
+            nm._announce_cost(model, payload)
+        return err.getvalue()
+
+    def test_announce_cost_quotes_the_actual_params_not_the_default_combo(self):
+        """回归：契约默认组合价 20、本次参数是 22 时，提交必须报 22。
+
+        改前 `_announce_cost` 不询价，`credit_estimate_text` 于是退回
+        `model["pricing"]`（默认组合价），用户按下确认时看到的是底价。
+        """
+        model = self._surcharged({"exact": True, "credits": 20.0, "note": None})
+        out = self._announce_text(model, {"quality": "high"},
+                                  quoted={"exact": True, "credits": 22.0, "yuan": 0.22})
+        self.assertIn("服务端权威价：22 积分", out)
+        self.assertNotIn("20 积分", out)
+
+    def test_announce_cost_shows_no_amount_when_quoting_fails(self):
+        """询价失败 → **不显示任何金额**（既不退回默认组合价，也不拿本地数字顶替）。
+
+        报价与真值可能冲突，冲突时以服务端结算为准；此时任何数字都可能与最终扣减对不上。
+        """
+        model = self._surcharged({"exact": True, "credits": 20.0, "note": None})
+        out = self._announce_text(model, {"quality": "high"}, quoted=None)
+        self.assertNotIn("20 积分", out)
+        self.assertNotIn("22 积分", out)
+        self.assertNotIn("预估", out)
+        self.assertIn("以生成结算为准", out)
+
+    def test_announce_cost_skips_the_quote_when_price_ignores_params(self):
+        """无加收规则 = 价格与参数无关，契约自带 pricing 即真值，不再多打一次请求。"""
+        model = spec_model(pricing={"exact": True, "credits": 15.0, "note": None})
+        with mock.patch.object(nm, "fetch_pricing") as spy:
+            out = self._announce_text(model, {}, quoted=None)
+        self.assertFalse(spy.called)
+        self.assertIn("服务端权威价：15 积分", out)
+
+    def test_contract_pricing_is_never_authoritative_for_the_actual_params(self):
+        """契约自带的 `pricing` 是**不传参数**的默认组合价，有加收规则时绝不能采信。
+
+        实测 `nano-banana-pro` 带 `?params=` 时该块是底价 20，用户选 4K 实付 22；
+        询价失败时不给数字（不退回底价，也不本地复算）。
+        """
+        model = self._surcharged({"exact": True, "credits": 20.0, "note": None})
+        out = self._announce_text(model, {"quality": "high"}, quoted=None)
+        self.assertNotIn("服务端权威价", out)
+        self.assertNotIn("20 积分", out)
+        self.assertNotIn("22 积分", out)
+        self.assertIn("以生成结算为准", out)
+
+    def test_announce_cost_shows_no_amount_and_no_server_note(self):
+        """服务端明说给不出确定值 → 不给数字，也不转述它的原因（那是给 agent 的指令）。"""
+        model = self._surcharged(
+            {"exact": False, "credits": None, "note": "该模型价格取决于参数：quality"})
+        out = self._announce_text(model, {"quality": "high"},
+                                  quoted={"exact": False, "credits": None,
+                                          "note": "该模型价格取决于参数：quality"})
+        self.assertIn("以生成结算为准", out)
+        self.assertNotIn("quality", out)
+        self.assertNotIn("params", out)
+
+    def test_quote_only_sends_params_that_change_the_price(self):
+        """询价只带**参与计费**的参数。
+
+        提示词等自由文本不参与计价，而它们会被拼进 GET 的 `?params=`——
+        实测 1200 字提示词编码后 10KB+，超 nginx 默认 8KB 请求头上限，
+        服务端 414、询价静默失败、报价退化成预估；同时用户内容不该落进访问日志。
+        """
+        model = self._surcharged({"exact": True, "credits": 20.0, "note": None})
+        seen: list = []
+
+        def _spy(m, p=None, **k):
+            seen.append(p)
+            return {"exact": True, "credits": 22.0}
+
+        import contextlib
+        import io
+        err = io.StringIO()
+        with mock.patch.object(nm, "fetch_pricing", side_effect=_spy), \
+                contextlib.redirect_stderr(err):
+            nm._announce_cost(model, {"quality": "high", "prompt": "一" * 1200})
+        self.assertEqual(seen, [{"quality": "high"}])      # prompt 不在询价里
+        self.assertIn("22 积分", err.getvalue())
+
+    def test_quote_params_is_empty_when_nothing_is_billable(self):
+        """没有任何命中的计费参数 → 空 dict（= 服务端按「未传参数」作答）。"""
+        model = self._surcharged({"exact": True, "credits": 20.0, "note": None})
+        self.assertEqual(
+            nm._pricing_quote_params(model, {"prompt": "x", "other": 1}), {})
+        self.assertEqual(
+            nm._pricing_quote_params(model, {"quality": "high", "prompt": "x"}),
+            {"quality": "high"})
+
+
+class PanelAndSubmitAgreeTest(unittest.TestCase):
+    """**面板报的价与提交报的价必须一致**——这是用户唯一能核对的两处数字。
+
+    改前两条路径各自决定要不要询价、要不要采信契约 `pricing`，同一个参数组合
+    在面板与提交处可以报出不同金额（`nano-banana-pro` 4K：面板 22、提交 20）。
+    这里逐格固定「面板文案 == 提交文案」，任一侧改了取价策略都会立刻失败。
+    """
+
+    CONTRACT = {"exact": True, "credits": 20.0, "yuan": 0.2, "note": None}
+    RULE = {"param": "imageSize", "match": "exact", "matchValue": "4K",
+            "charge": "fixed", "credits": 2.0}
+    PARAMS = [{"name": "prompt", "type": "string", "required": True},
+              {"name": "imageSize", "type": "string", "required": True,
+               "values": ["1K", "2K", "4K"]}]
+
+    def _model(self, *, rules: bool = True, pricing=CONTRACT):
+        return nm._normalize_model({
+            "model": "m", "modelType": "image", "status": "online",
+            "protocols": ["openai"],
+            "billing": {"mode": "per_request", "price": 20.0, "unit": 1},
+            "pricing": pricing,
+            "surchargeRules": [dict(self.RULE)] if rules else [],
+            "params": [dict(p) for p in self.PARAMS],
+        })
+
+    def _submit_text(self, model, payload, quoted):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with mock.patch.object(nm, "fetch_pricing", return_value=quoted), \
+                contextlib.redirect_stderr(err):
+            nm._announce_cost(model, payload)
+        return err.getvalue().strip()[len("[费用] "):]
+
+    def _panel(self, model, chosen, quoted):
+        with mock.patch.object(nm, "fetch_pricing", return_value=quoted):
+            return nm.build_param_form(model, chosen_params=chosen)
+
+    def test_every_pricing_state_reports_the_same_text_on_both_paths(self):
+        quoted_ok = {"exact": True, "credits": 22.0, "yuan": 0.22}
+        quoted_null = {"exact": False, "credits": None, "note": "该模型价格取决于参数：imageSize"}
+        cases = [
+            ("有规则/询价成功", self._model(), quoted_ok),
+            ("有规则/询价失败", self._model(), None),
+            ("有规则/服务端说不确定", self._model(), quoted_null),
+            ("无规则/契约有价", self._model(rules=False), None),
+            ("无规则/旧后端无价", self._model(rules=False, pricing=None), None),
+        ]
+        for label, model, quoted in cases:
+            with self.subTest(label=label):
+                chosen = {"imageSize": "4K"}
+                panel = self._panel(model, chosen, quoted)
+                self.assertEqual(
+                    panel["credit_estimate_text"],
+                    self._submit_text(model, chosen, quoted),
+                    "面板与提交报了不同的价",
+                )
+
+    def test_panel_number_matches_the_text_it_ships_with(self):
+        """文案说 N 积分时，数值层必须就是 N；两层都无数字时也必须一致。
+
+        两层同源是硬约束：只要一层有数字、另一层没有，agent 报给用户的对错就全凭运气。
+        """
+        for label, model, quoted in [
+            ("询价成功", self._model(), {"exact": True, "credits": 22.0, "yuan": 0.22}),
+            ("询价失败", self._model(), None),
+            ("服务端说不确定", self._model(),
+             {"exact": False, "credits": None, "note": "x"}),
+        ]:
+            with self.subTest(label=label):
+                panel = self._panel(model, {"imageSize": "4K"}, quoted)
+                credits = panel["credit_estimate"]["credits"]
+                text = panel["credit_estimate_text"]
+                if credits is None:
+                    self.assertIn("以生成结算为准", text)
+                    self.assertNotIn("服务端权威价", text)
+                else:
+                    self.assertIn(nm._fmt_num(credits) + " 积分", text)
+
+    def test_no_rule_model_never_spends_a_request_on_quoting(self):
+        """无加收规则 = 价格与参数无关，契约 `pricing` 即真值，两条路径都不该再询价。"""
+        model = self._model(rules=False)
+        with mock.patch.object(nm, "fetch_pricing") as spy:
+            panel = nm.build_param_form(model, chosen_params={"imageSize": "4K"})
+        self.assertFalse(spy.called)
+        self.assertEqual(panel["credit_estimate"]["credits"], 20.0)
 
 
 class SanitizeTest(unittest.TestCase):
@@ -634,7 +862,7 @@ class PriceTextTest(unittest.TestCase):
             surchargeRules=[{"param": "duration", "match": "present",
                              "charge": "multiply_by_value", "multiplier": 60.0,
                              "base": 0.0}])
-        self.assertEqual(nm._price_text(model), "按用量计价（见加收规则）")
+        self.assertEqual(nm._price_text(model), "按用量计价")
 
     def test_zero_price_without_rules_says_unknown(self):
         model = spec_model(billing={"mode": "per_request", "price": 0.0, "unit": 1})
@@ -666,7 +894,7 @@ class PriceTextTest(unittest.TestCase):
         self.assertEqual(spec["mode"], "per_request")
         self.assertEqual(spec["surcharge_rules"], [rule])       # 原样透传，机器消费
         self.assertEqual(len(spec["surcharge_text"]), 1)         # 人读句子同源
-        self.assertEqual(spec["text"], "按用量计价（见加收规则）")
+        self.assertEqual(spec["text"], "按用量计价")
 
 
 class FriendlyErrorTest(unittest.TestCase):
@@ -1160,12 +1388,13 @@ class ModelsListingTest(unittest.TestCase):
         """
         _, out = self._render(["models"])
         self.assertNotIn("线路", out)
-        self.assertNotIn("↳", out.replace("↳ 加收：", ""))   # 加收子行保留，线路子行不保留
+        self.assertNotIn("↳", out)          # 任何形态的子行（线路 / 加收）都不再打印
 
-    def test_listing_shows_surcharge_rules(self):
+    def test_listing_never_prints_surcharge_detail(self):
+        """加收明细不进人读输出：用户要的是「一共多少」，不是费率分解。"""
         _, out = self._render(["models"])
-        self.assertIn("↳ 加收：", out)
-        self.assertIn("duration × 25 积分", out)
+        self.assertNotIn("加收", out)
+        self.assertNotIn("duration × 25 积分", out)
 
     def test_listing_carries_usage_and_time_expectations(self):
         _, out = self._render(["models"])
@@ -1441,11 +1670,12 @@ class FormPanelTest(unittest.TestCase):
 
     @staticmethod
     def _raw(code, *, mtype="image", status="online", name="Demo Image",
-             price=15.0, params=None, rules=None):
+             price=15.0, params=None, rules=None, pricing=None):
         return {
             "model": code, "displayName": name, "modelType": mtype,
             "status": status, "protocols": ["openai"],
             "billing": {"mode": "per_request", "price": price, "unit": 1},
+            "pricing": pricing,
             "surchargeRules": rules or [],
             "params": list(params if params is not None else []),
         }
@@ -1453,7 +1683,8 @@ class FormPanelTest(unittest.TestCase):
     def _models(self):
         return [nm._normalize_model(item) for item in (
             # 同名 + 两条独立编码：这是生产真实形状（同一展示名对应多个模型）
-            self._raw("img-a", name="Demo Image", params=self.IMAGE_PARAMS),
+            self._raw("img-a", name="Demo Image", params=self.IMAGE_PARAMS,
+                     pricing={"exact": True, "credits": 15.0, "yuan": 0.15, "note": None}),
             self._raw("img-c", name="Demo Image", price=20.0),
             self._raw("img-b", name="Retired", status="maintenance"),
             self._raw("", name="Mystery"),                       # 平台没给调用编码
@@ -1633,11 +1864,20 @@ class FormPanelTest(unittest.TestCase):
         self.assertIn("100 积分 = 1 元", panel["credit_estimate_text"])
 
     def test_param_panel_surcharge_is_added_to_the_quote(self):
+        """有加收规则时按**本次参数**向服务端询价，并照抄服务端算好的金额。
+
+        金额由服务端给（`pricing.credits`），脚本不自己按 `surchargeRules` 算——
+        本地复算与服务端结算存在分歧时以服务端为准。
+        """
         model = nm._normalize_model(self._raw(
             "vid-x", mtype="video", price=0.0,
             rules=[{"param": "duration", "match": "present",
                     "charge": "multiply_by_value", "multiplier": 60.0, "base": 0.0}]))
-        panel = nm.build_param_form(model, chosen_params={"duration": 5})
+        with mock.patch.object(nm, "fetch_pricing",
+                               return_value={"exact": True, "credits": 300.0,
+                                             "yuan": 3.0, "note": None}) as spy:
+            panel = nm.build_param_form(model, chosen_params={"duration": 5})
+        self.assertTrue(spy.called, "有加收规则时必须按本次参数询价")
         self.assertEqual(panel["credit_estimate"]["credits"], 300.0)
         self.assertIn("300 积分", panel["credit_estimate_text"])
 
@@ -2100,9 +2340,132 @@ class SingleValuePresetTest(unittest.TestCase):
         self.assertIn("resolution", str(ctx.exception.message))
 
     def test_panel_quote_includes_the_preset_params(self):
-        panel = nm.build_param_form(self._model(), chosen_params={"duration": 5})
+        """单值预设必须并入询价参数：少传一个参与计费的参数会低估费用。
+
+        这里断言的是「询价请求里带上了 duration」——金额本身由服务端给。
+        """
+        with mock.patch.object(nm, "fetch_pricing",
+                               return_value={"exact": True, "credits": 125.0,
+                                             "yuan": 1.25, "note": None}) as spy:
+            panel = nm.build_param_form(self._model(), chosen_params={"duration": 5})
+        sent = spy.call_args[0][1]
+        self.assertEqual(sent.get("duration"), 5)
         self.assertEqual(panel["credit_estimate"]["credits"], 125.0)
         self.assertIn("125 积分", panel["credit_estimate_text"])
+
+    def test_panel_quote_has_one_number_when_the_server_answers(self):
+        """面板不得同时拿出两个数字：服务端答了就以服务端为准。
+
+        改前 `credit_estimate` 恒为本地复算、`credit_estimate_text` 取服务端，
+        两者可不一致（实测 4K：文案 22 而 credit_estimate 是 20）。
+        """
+        model = self._model()
+        with mock.patch.object(nm, "fetch_pricing",
+                               return_value={"exact": True, "credits": 99.0, "yuan": 0.99}):
+            panel = nm.build_param_form(model, chosen_params={"duration": 5})
+        self.assertEqual(panel["credit_estimate"]["credits"], 99.0)
+        self.assertTrue(panel["credit_estimate"]["exact"])
+        self.assertIn("99", panel["credit_estimate_text"])
+        self.assertNotIn("125", panel["credit_estimate_text"])
+
+    def test_panel_quote_shows_no_amount_when_the_server_is_silent(self):
+        """询价失败（或旧后端）→ 数值层与文案层**都不给数字**。
+
+        本地复算与服务端结算并不总是等价：存在服务端明说给不出确定值、本地却算得出
+        数字的情形。冲突时以服务端为准，因此本地数字一律不上屏。
+        """
+        with mock.patch.object(nm, "fetch_pricing", return_value=None):
+            panel = nm.build_param_form(self._model(), chosen_params={"duration": 5})
+        self.assertIsNone(panel["credit_estimate"]["credits"])
+        self.assertFalse(panel["credit_estimate"]["exact"])
+        self.assertIn("以生成结算为准", panel["credit_estimate_text"])
+        self.assertNotIn("125", panel["credit_estimate_text"])
+
+    def test_panel_never_shows_the_contract_default_combo(self):
+        """询价失败时**不得**退回契约自带的默认组合价，也不得拿本地复算顶替。
+
+        契约 `pricing` 是「不传参数」的默认组合价，对本次参数而言与底价等价（实测
+        `nano-banana-pro` 4K 实付 22、该块是 20）。询价失败时唯一正确做法是**不给数字**。
+        """
+        model = self._model()
+        model["pricing"] = {"exact": True, "credits": 20.0, "yuan": 0.2, "note": None}
+        with mock.patch.object(nm, "fetch_pricing", return_value=None):
+            panel = nm.build_param_form(model, chosen_params={"duration": 5})
+        self.assertIsNone(panel["credit_estimate"]["credits"])
+        self.assertNotIn("20 积分", panel["credit_estimate_text"])
+        self.assertNotIn("125", panel["credit_estimate_text"])
+        self.assertIn("以生成结算为准", panel["credit_estimate_text"])
+
+    def test_panel_number_and_text_agree_when_the_server_cannot_price(self):
+        """服务端明说给不出确定值（时长型）时，两层都留空，且**不转述服务端原因**。
+
+        服务端 `note`（如「请核对参数取值后用 params 重新询价」）是给 agent 的接口指令，
+        只保留在机器可读的 `credit_estimate.note` 里。
+        """
+        note = "该模型价格取决于参数：duration；请核对参数取值后用 params 重新询价"
+        with mock.patch.object(nm, "fetch_pricing",
+                               return_value={"exact": False, "credits": None, "note": note}):
+            panel = nm.build_param_form(self._model(), chosen_params={"duration": 5})
+        self.assertIsNone(panel["credit_estimate"]["credits"])
+        self.assertFalse(panel["credit_estimate"]["exact"])
+        self.assertIn("以生成结算为准", panel["credit_estimate_text"])
+        self.assertNotIn("125", panel["credit_estimate_text"])
+        self.assertNotIn("duration", panel["credit_estimate_text"])
+        self.assertNotIn("params", panel["credit_estimate_text"])
+        # 原因仍保留在机器可读字段里，供 agent 自行决策。
+        self.assertIn("params", panel["credit_estimate"]["note"])
+
+
+class NumericRangePreflightTest(unittest.TestCase):
+    """数值越界必须发请求前拦下。
+
+    面板已经按用户给的数算出金额（`duration=999` → 24975 积分），
+    而平台会因越界直接 400 拒单。不拦 = 先报一个不可能成交的价。
+    """
+
+    MODEL = {
+        "model": "v", "displayName": "V", "modelType": "video", "status": "online",
+        "protocols": ["openai"],
+        "billing": {"mode": "per_request", "price": 0, "unit": 1},
+        "surchargeRules": [{"param": "duration", "match": "present",
+                            "charge": "multiply_by_value", "multiplier": 25.0}],
+        "params": [{"name": "prompt", "type": "string", "required": True},
+                   {"name": "duration", "type": "number", "required": True,
+                    "min": 4, "max": 15}]}
+
+    @classmethod
+    def _model(cls):
+        return nm._normalize_model(dict(cls.MODEL))
+
+    def _check(self, raw):
+        args = mock.Mock(param=[("duration", raw)], ref_image=None,
+                         ref_video=None, ref_audio=None)
+        return nm._ensure_param_values(self._model(), args)
+
+    def test_out_of_range_is_rejected_before_the_request(self):
+        for raw in ("999", "16"):
+            with self.subTest(raw=raw), self.assertRaises(nm.NoovaError) as ctx:
+                self._check(raw)
+            self.assertIn("不能大于 15", str(ctx.exception.message))
+
+    def test_below_min_is_rejected(self):
+        with self.assertRaises(nm.NoovaError) as ctx:
+            self._check("3")
+        self.assertIn("不能小于 4", str(ctx.exception.message))
+
+    def test_boundaries_and_fractionals_pass(self):
+        for raw in ("4", "15", "5.5"):
+            with self.subTest(raw=raw):
+                self._check(raw)          # 不抛即通过
+
+    def test_non_numeric_is_left_to_the_platform(self):
+        """转不成数字就不在本地猜——交给平台判（保守放行）。"""
+        self._check("abc")
+
+    def test_range_error_hint_says_retry_is_useless(self):
+        with self.assertRaises(nm.NoovaError) as ctx:
+            self._check("99")
+        self.assertIn("重试无效", ctx.exception.hint or "")
 
 
 class SurchargeBaseDefaultTest(unittest.TestCase):
@@ -2138,7 +2501,7 @@ class SurchargeBaseDefaultTest(unittest.TestCase):
                 self.assertIn(approx["kind"], ("range", "exact"))
 
     def test_missing_base_quote_matches_the_gateway_formula(self):
-        """网关 `_resolve_param_rule_charge_cost` 的口径：`base + 值 × multiplier`。"""
+        """平台服务端结算口径：`base + 值 × multiplier`。"""
         for duration in (4, 5, 10, 15, 30):
             with self.subTest(duration=duration):
                 cost = nm.compute_credit_cost(self._model(25.0), {"duration": duration})
@@ -2217,8 +2580,7 @@ class QuoteParityTest(unittest.TestCase):
     """报价对账（生产契约数字）：本地 `compute_credit_cost` 必须与网关逐条一致。
 
     夹具取自**生产契约的真实形状**（39 个模型 × 全部参数取值组合，实测 399 组零不一致）。
-    网关侧公式见 `../noova-backend/app/services/api_gateway_proxy_service.py` 的
-    `_calculate_cost_decimal` + `_resolve_param_rule_charge_cost`：
+    网关侧公式（平台服务端结算）：
     `总价 = billing_price × billing_unit + Σ 命中规则加收`。
     """
 

@@ -5,7 +5,7 @@ license: MIT — see the LICENSE file in this repository.
 compatibility: "需要 Python ≥ 3.8（仅标准库，无第三方依赖）；运行时需能访问 https://noova.vip 或 https://noova.live。"
 metadata:
   author: NooVa AI
-  version: "1.10.0"
+  version: "1.11.0"
 ---
 
 # NooVa AI 生成调用（公开 API）
@@ -307,6 +307,8 @@ python3 <SKILL_DIR>/scripts/noova_media.py form --code <模型编码> --json
    - `required: true` 的项**必须**有值，缺了脚本会拒发请求。
    - **取值合法性由脚本按契约预检**：传了不在 `values` 里的值，脚本发请求前就拒发并列出合法取值
      （不会浪费一次往返，也不会扣费）。看到该报错就回到面板重新取值，**不要原样重试**。
+   - **数值区间同样在发请求前预检**：数值型参数（`type` 为 `number`/`integer` 等）带 `min`/`max` 时，
+     越界会被脚本拦下并报出边界（`参数取值超出契约范围：…`）。这类错误**重试无效**，只能改数值。
    - `hidden_fields` 是脚本自动处理的字段（如 `model`），**不要拿去问用户**。
    - `fields` 为空时按 `empty_note` 说明该模型无额外参数，只需提示词。
 4. **确认后立即生成**：把参数面板给用户看时，**必须**同时给出面板里的 `confirm_hint`
@@ -361,11 +363,16 @@ python3 <SKILL_DIR>/scripts/noova_media.py params --code <模型编码> --json
 - `values` 为空 → 该参数是**自由文本**，没有固定取值，**任何情况下都不要编造枚举**。
 - 数值型参数给出 `min`~`max`；数组型给出 `minItems`~`maxItems`（项数）。
 - 契约里**没有 `description`**：不要向用户声称"某个参数的说明里写了什么"。
-- 报价优先用**服务端权威价**：用户选定参数后，`form --code <编码> --param 名=值 --json` 给出的
-  `credit_estimate_text` 会先向服务端询价，成功时是「**服务端权威价**：N 积分」（即 `pricing.credits`，
-  由服务端算出）；服务端给不出确定值时如实说明（`credits: null` + `note`）；只有旧后端才回退
-  「**按契约预估**」（按 `billing` + `surchargeRules` 本地复算）。换算人民币统一用
-  `credit_per_yuan`（100 积分 = 1 元）。真实扣费以生成结束时的「本次扣减（账户余额差值）」为准。
+- 报价**只在服务端给出确定值时才显示数字**：用户选定参数后，`form --code <编码> --param 名=值 --json`
+  给出的 `credit_estimate_text` 会先向服务端询价；服务端给出确定值（`pricing.credits` + `exact: true`）
+  时文案是「**服务端权威价**：N 积分」。
+- **服务端给不出确定值时，不要显示任何金额**（文案是「本次消耗以生成结算为准」）。
+  此时**唯一可信的信息是生成结束后的「本次扣减（账户余额差值）」**——余额变了多少就是花了多少。
+  理由：报价与真值可能冲突，冲突时一律以服务端结算为准；给不出确定值时任何数字（含按
+  `billing` + `surchargeRules` 本地复算的「预估」）都可能与最终扣减对不上，摆到用户面前就是误导。
+  **不要向用户转述服务端的 `note`**（如「请核对参数取值后用 params 重新询价」）——那是给 agent
+  的接口指令，不是给用户的解释；它只保留在机器可读字段 `credit_estimate.note` 里。
+- 换算人民币统一用 `credit_per_yuan`（100 积分 = 1 元）。
 - 同名模型**靠模型编码区分**（`models` 会把同名的一组摆在一起并给出各自编码与计价）。
   编码是请求里唯一要传的值，也是唯一可靠的选择键；不引入任何展示用的近似标签。
 
@@ -469,10 +476,10 @@ python3 <SKILL_DIR>/scripts/noova_media.py video --prompt "..." --no-wait
 余额明细括号只在接口返回对应字段时出现；余额查询失败则整两行省略（不会中断生成）。
 
 - 「本次扣减」的口径是**账户余额差值**（生成前 / 终态后各查一次 `GET /api/v1/credit`），
-  是**唯一可核对的真实消耗**。确认前给出的 `credit_estimate_text` 优先引用**服务端权威价**
-  （`pricing.credits`）；只有旧后端无 `pricing` 时才是「按契约预估」（本地按
-  `billing` + `surchargeRules` 复算）。向用户解释时要把「报价」和「真值」分开说，
-  不要把报价说成账单。
+  是**唯一可核对的真实消耗**。确认前给出的 `credit_estimate_text` **只在服务端给出确定值时**
+  才带数字（`pricing.credits` + `exact: true`）；服务端给不出确定值时文案只说
+  「本次消耗以生成结算为准」，**不给任何金额**。向用户解释时要把「报价」和「真值」分开说，
+  不要把报价说成账单；服务端给不出价时，**直接以生成后的余额变化为准**，不要另找一个数字补上。
   **余额没有变化时脚本会说「本次未产生扣费」，不会写「本次扣减：0 积分」**——后者会被读成免费。
 - 「计价」是该模型的公开单价（含按次 / 按 token / 按用量三种形态）。**报价只引用它，不要自己算**。
 - 想省掉这两次余额查询（例如批量调用）：加 `--no-credit`。

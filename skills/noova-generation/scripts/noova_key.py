@@ -92,7 +92,7 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 
 PACKAGE_NAME = "noova-generation"
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 # 脚本自身位置：用于生成「绝对路径命令」，避免提示里的相对路径在任意 cwd 下失效。
 SCRIPT_DIR = Path(__file__).resolve().parent
